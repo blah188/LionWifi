@@ -326,6 +326,11 @@ public:
 #else
     bool SendFileResponse(const char *name, bool sd, bool tail, bool forceDownload = false)
     {
+        if (!Logger.TryLockFsSemaphore()) // no-op (true) on ESP8266; real lock on ESP32+WebServer
+        {
+            _server.send(429, __text_plain__F, F("Server Busy"));
+            return false;
+        }
         File dataFile;
 
 #ifdef USE_SD_CARD
@@ -342,38 +347,52 @@ public:
 
         if (!dataFile)
         {
+            Logger.UnlockFsSemaphore();
             if (_logger)
                 _logger->Log_P(ILogger::LvlWarning, PSTR("sendFileResponse: %s file %s not found"), (sd ? F("SD") : F("SP")), name);
-            _server.send(404, __text_plain__F, String("Can't find ") + (sd ? F("SD") : F("SP")) + F(" file ") + name);
+            _server.send(404, __text_plain__F, String(F("Can't find ")) + (sd ? F("SD") : F("SP")) + F(" file ") + name);
             return false;
-        }
-        int size = dataFile.size();
-        if (tail) // Only tail
-        {
-            if (size > TailSize)
-            {
-                dataFile.seek(dataFile.size() - TailSize);
-                size = TailSize;
-            }
         }
         if (forceDownload)
         {
-// #ifndef LFS            
-//             if (!sd)
-//                 name = String(name).substring(1).c_str();
-// #endif
             _server.sendHeader(F("Content-Disposition"), String(F("attachment; filename=")) + (name[0] == '/'?name+1:name));
             _server.sendHeader(F("Content-Transfer-Encoding"), F("binary"));
             _server.sendHeader(F("Expires"), F("0"));
             _server.sendHeader(F("Cache-Control"), F("must-revalidate, post-check=0, pre-check=0"));
             _server.sendHeader(F("Pragma"), F("public"));
         }
+        if (tail) // Send only the last TailSize bytes with a CORRECT Content-Length.
+        {         // streamFile() advertises the full file size while sending only
+                  // the tail → body/length mismatch and a hung client on big logs.
+            uint32_t fsize = dataFile.size();
+            uint32_t pos = fsize > TailSize ? fsize - TailSize : 0;
+            if (pos)
+                dataFile.seek(pos);
+            char *buf = new char[TailSize + 1];
+            if (!buf)
+            {
+                dataFile.close();
+                Logger.UnlockFsSemaphore();
+                _server.send(500, __text_plain__F, F("500: out of memory"));
+                return false;
+            }
+            size_t read = dataFile.readBytes(buf, TailSize);
+            dataFile.close();
+            buf[read] = 0;
+            _server.send(200, GetContentType(name), buf); // Content-Length = bytes sent
+            delete[] buf;
+            Logger.UnlockFsSemaphore();
+            if (_logger)
+                _logger->Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)read);
+            return true;
+        }
         size_t sent = _server.streamFile(dataFile, GetContentType(name));
         dataFile.close();
+        Logger.UnlockFsSemaphore();
 #ifndef LOG_FAVICON
-        if (_logger && strcasecmp_P(name, __slash_favicon_ico__P) != 0 && strcasecmp_P(name, __slash_favicon_ico__P) != 0)
-#endif        
-            _logger->Log_P(ILogger::LvlDebug, PSTR("Sent %s(%s), %u bytes"), name, sd ? "Sd" : "SP", sent);
+        if (_logger && strcasecmp_P(name, __slash_favicon_ico__P) != 0)
+#endif
+            _logger->Log_P(ILogger::LvlDebug, PSTR("Sent %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)sent);
         return true;
     }
 #endif
@@ -741,7 +760,7 @@ public:
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     void HandleLs(AsyncWebServerRequest *request, bool sd)
     {
-        Logger.Log_P(ILogger::LvlDebug, PSTR("Got LS requesd, SD = %d, free mem = %ld"), (int)sd,  esp_get_free_heap_size());
+        Logger.Log_P(ILogger::LvlDebug, PSTR("Got LS request, SD = %d, free mem = %ld"), (int)sd,  esp_get_free_heap_size());
         String folder;
         if (!DoAuth(request))
             return;
@@ -775,7 +794,12 @@ public:
         StringStream lsFile(buffer);
 #ifndef ESP32
         _server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-#else        
+#else
+        // ESP32 builds the whole page in one String before sending (the async
+        // server has no per-row chunking here). Reserve once up-front so it grows
+        // in a single allocation instead of churning/fragmenting the heap; rows
+        // average ~180 B. (A true streaming fix would need beginChunkedResponse.)
+        buffer.reserve(512 + (size_t)files.Length() * 180);
         rtc_wdt_feed();
 #endif
         lsFile.printf_P(PSTR("<html> <body> <form method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"> <input class=\"button\" type=\"submit\" value=\"Upload\"></form>"));

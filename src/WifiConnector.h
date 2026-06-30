@@ -204,6 +204,11 @@ public:
     WifiConnector(const char *ssid, const char *pwd, const char *ssid1 = NULL, const char *pwd1 = NULL, const char *ssid2 = NULL, const char *pwd2 = NULL)
     {
         _on = true;
+        // Arm the fatal-reconnect window from boot, not from epoch 0. Otherwise
+        // _lastConnectedTime stays 0 and (millis() - 0) crosses
+        // WIFI_FATAL_CONNECT_TIMEOUT after ~3 min of uptime, rebooting a device
+        // that simply hasn't connected yet (slow/out-of-range AP at power-on).
+        _lastConnectedTime = millis();
         _ssids += new String(ssid);
         _passwords += new String(pwd);
         if (ssid1 && pwd1)
@@ -417,7 +422,12 @@ public:
 #else
         uint32_t freeHeap = ESP.getFreeHeap();
         uint32_t maxAlloc = ESP.getMaxAllocHeap();
-        uint8_t frag = freeHeap > 0 ? (uint8_t)(100 - (uint8_t)((uint32_t)maxAlloc * 100 / freeHeap)) : 0;
+        // Clamp the ratio to <=100 so frag never wraps to a bogus >100% value
+        // (maxAlloc can momentarily exceed the free-heap accounting).
+        uint32_t allocRatio = freeHeap > 0 ? (uint32_t)maxAlloc * 100 / freeHeap : 100;
+        if (allocRatio > 100)
+            allocRatio = 100;
+        uint8_t frag = (uint8_t)(100 - allocRatio);
 #endif
 #endif
 
@@ -582,7 +592,11 @@ public:
                 server.begin();
                 Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP server started"));
 #endif
-                _myOta->Begin();
+                if (!_otaStarted) // begin OTA once; re-begin on each reconnect re-advertises mDNS needlessly
+                {
+                    _myOta->Begin();
+                    _otaStarted = true;
+                }
                 if (_conEvent)
                     _conEvent();
             }
@@ -593,13 +607,16 @@ public:
 #ifdef PING_ROUTER
             if (millis() - _lastRouterPingTime > PING_ROUTER_INTERVAL)
             {
-                // Serial.printf_P(PSTR("Pinging router: "));
                 _lastRouterPingTime = millis();
-                if (SharedWifiClient()->connect(PING_ROUTER, 80))
+                // Use a private, short-lived client — never the shared _client,
+                // which a consumer may be using concurrently (esp. on ESP32 where
+                // this runs in the WiFi task while handlers run elsewhere).
+                WiFiClient pingClient;
+                pingClient.setTimeout(WIFI_CLIENT_TIMEOUT);
+                if (pingClient.connect(PING_ROUTER, 80))
                 {
                     _routerPingErrorsInRow = 0;
                     ++_routerPingSuccessesInRow;
-                    // Logger.Log_P(ILogger::LvlDebug, PSTR("All OK in Baghdad"));
                 }
                 else
                 {
@@ -607,12 +624,16 @@ public:
                     Logger.Log_P(ILogger::LvlWarning, PSTR("Router ping failed in %lums"), millis() - _lastRouterPingTime);
                     if (++_routerPingErrorsInRow > PING_ROUTER_MAX_FAILURES)
                     {
-                        Logger.Log_P(ILogger::LvlInfo, PSTR("!!! Rebooting devce as router ping failed %d times"), _routerPingErrorsInRow);
+                        Logger.Log_P(ILogger::LvlInfo, PSTR("!!! Rebooting device as router ping failed %d times"), _routerPingErrorsInRow);
                         delay(300);
                         ESP.restart();
                     }
                 }
-                StopSharedWifiClient();
+#ifdef ESP32
+                pingClient.stop();
+#else
+                pingClient.abort();
+#endif
             }
 #endif
         }
@@ -633,7 +654,7 @@ public:
 #ifndef FORBID_WIFI_MONITOR
             else if (millis() - _lastConnectedTime > WIFI_FATAL_CONNECT_TIMEOUT)
             {
-                Logger.Log_P(ILogger::LvlInfo, PSTR("!!! Rebooting devce as disconnected for %lus"), millis() - _lastConnectedTime);
+                Logger.Log_P(ILogger::LvlInfo, PSTR("!!! Rebooting device as disconnected for %lus"), (millis() - _lastConnectedTime) / 1000UL);
                 delay(300);
                 ESP.restart();
             }
