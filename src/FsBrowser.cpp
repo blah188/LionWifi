@@ -1,9 +1,13 @@
 #include "DirEntry.h"
 
 #ifdef ESP32
+#ifdef NO_ASYNC_WEB_SERVER
+#include <WebServer.h>
+#else
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
-#else
+#endif
+#else // ESP8266
 #include <ESP8266WebServer.h>
 #endif
 
@@ -29,7 +33,7 @@ int DirEntrySort(const void *cmp1, const void *cmp2)
     return strcmp(a->fullName, b->fullName);
 }
 
-#ifdef ESP32
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER) // DebugDumpRequest uses the async request type
 void DebugDumpRequest(AsyncWebServerRequest *request)
 {
     Serial.println(request->version());       // uint8_t: 0 = HTTP/1.0, 1 = HTTP/1.1
