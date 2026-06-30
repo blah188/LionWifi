@@ -19,21 +19,35 @@
 #else
 #include <ESPAsyncWebServer.h>
 #endif
-#else
+#else // ESP8266
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
 #endif
 
+// ---- Filesystem selection: define EXACTLY ONE of USE_SPIFFS / LFS -----------
+// LIONWIFI_FS is the chosen FS object; use it everywhere instead of branching on
+// LFS/USE_SPIFFS. LIONWIFI_FS_NAME is its short label for logs.
+#if defined(USE_SPIFFS) && defined(LFS)
+#error "LionWifi: define only ONE filesystem — USE_SPIFFS or LFS, not both."
+#endif
+#if !defined(USE_SPIFFS) && !defined(LFS)
+#error "LionWifi: no filesystem selected — define -D USE_SPIFFS or -D LFS (LittleFS)."
+#endif
+
 #ifdef LFS
 #include <LittleFS.h>
-#endif
-#ifdef USE_SPIFFS
+#define LIONWIFI_FS LittleFS
+#define LIONWIFI_FS_NAME "LFS"
+#else // USE_SPIFFS
 #ifdef ESP32
 #include <SPIFFS.h>
 #else
 #include <FS.h>
 #endif
+#define LIONWIFI_FS SPIFFS
+#define LIONWIFI_FS_NAME "SPIFFS"
 #endif
+
 #ifdef USE_SD_CARD
 #ifdef SDFAT
 #include <SdFat.h>
@@ -89,24 +103,25 @@ private:
 #endif
     bool _doAuth = false;
     const char *_username = nullptr, *_password = nullptr;
-    ILogger *_logger = nullptr;
-#if defined(USE_SD_CARD) && defined(SDFAT)  
+#if defined(USE_SD_CARD) && defined(SDFAT)
     File32 _fsSdUploadFile;
 #endif
     File _fsUploadFile;
 
 public:
+    // `server` is the consumer's web server (type varies by platform/build).
+    // Diagnostics and the FS semaphore go through the global LionLogger `Logger`.
+    // Pass username/password for HTTP Basic auth, or NULL/NULL to disable it.
 #ifdef ESP32
 #ifdef NO_ASYNC_WEB_SERVER
-    FsBrowser(ILogger *logger, WebServer &server, const char *username, const char *password) : _server(server)
+    FsBrowser(WebServer &server, const char *username, const char *password) : _server(server)
 #else
-    FsBrowser(ILogger *logger, AsyncWebServer &server, const char *username, const char *password) : _server(server)
+    FsBrowser(AsyncWebServer &server, const char *username, const char *password) : _server(server)
 #endif
-#else
-    FsBrowser(ILogger *logger, ESP8266WebServer &server, const char *username, const char *password) : _server(server)
+#else // ESP8266
+    FsBrowser(ESP8266WebServer &server, const char *username, const char *password) : _server(server)
 #endif
     {
-        _logger = logger;
         if (username && password)
         {
             _username = username;
@@ -120,8 +135,10 @@ public:
     FsBrowser(const FsBrowser &) = delete;
     FsBrowser &operator=(const FsBrowser &) = delete;
 
-    static String GetContentType(const String &filename)
-    { // convert the file extension to the MIME type
+    // Returns a flash-resident MIME type for the file extension (no String built
+    // here; the caller materializes one only if its API needs it).
+    static const __FlashStringHelper *GetContentType(const String &filename)
+    {
         if (filename.endsWith(".html") || filename.endsWith(".htm"))
             return __text_html__F;
         else if (filename.endsWith(".css"))
@@ -195,8 +212,7 @@ public:
         if (_doAuth && !_server.authenticate(_username, _password))
         {
             _server.requestAuthentication();
-            if (_logger)
-                _logger->Log_P(ILogger::LvlWarning, PSTR("Need auth for %d.%d.%d.%d: %s"), _server.client().remoteIP()[0], _server.client().remoteIP()[1], _server.client().remoteIP()[2], _server.client().remoteIP()[3], _server.uri().c_str());
+            Logger.Log_P(ILogger::LvlWarning, PSTR("Need auth for %d.%d.%d.%d: %s"), _server.client().remoteIP()[0], _server.client().remoteIP()[1], _server.client().remoteIP()[2], _server.client().remoteIP()[3], _server.uri().c_str());
             return false;
         }
         return true;
@@ -209,7 +225,7 @@ public:
         bool exists = false;
         if (!Logger.TryLockFsSemaphore())
         {
-            request->send(429, __text_plain__F, "Server Busy");
+            request->send(429, __text_plain__F, F("Server Busy"));
             return false;
         }
 #ifdef USE_SD_CARD
@@ -221,20 +237,13 @@ public:
             exists = SD.exists(sdPath.c_str());
         }
 #endif
-#ifdef LFS
         if (!sd)
-            exists = LittleFS.exists(name);
-#endif
-#ifdef USE_SPIFFS
-        if (!sd)
-            exists = SPIFFS.exists(name);
-#endif
+            exists = LIONWIFI_FS.exists(name);
         if (!exists)
         {
             Logger.UnlockFsSemaphore();
-            if (_logger)
-                _logger->Log_P(ILogger::LvlWarning, PSTR("sendFileResponse: %s file %s not found"), (sd ? F("SD") : F("SP")), name);
-            request->send(404, __text_plain__F, String("Can't find ") + (sd ? F("SD") : F("SP")) + F(" file ") + name);
+            Logger.Log_P(ILogger::LvlWarning, PSTR("sendFileResponse: %s file %s not found"), (sd ? F("SD") : F("SP")), name);
+            request->send(404, __text_plain__F, String(F("Can't find ")) + (sd ? F("SD") : F("SP")) + F(" file ") + name);
             return false;
         }
 #if defined(USE_SD_CARD) && defined(SDFAT)
@@ -259,12 +268,7 @@ public:
             }
             else
 #endif
-#ifdef LFS
-                dataFile = LittleFS.open(name, "r");
-#endif
-#ifdef USE_SPIFFS
-            dataFile = SPIFFS.open(name, "r");
-#endif
+                dataFile = LIONWIFI_FS.open(name, "r");
 
 #if defined(USE_SD_CARD) && defined(SDFAT)
             if (sdDataFile.size() > TailSize)
@@ -276,8 +280,7 @@ public:
             if (tailPos)
                 dataFile.seek(tailPos);
             size_t read = dataFile.readBytes(buf, TailSize);
-            if (_logger)
-                _logger->Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: sending %u tail bytes (from pos %lu) of file %s"), (unsigned)read, (unsigned long)tailPos, name);
+            Logger.Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: sending %u tail bytes (from pos %lu) of file %s"), (unsigned)read, (unsigned long)tailPos, name);
             dataFile.close();
 #endif
             buf[read] = 0;
@@ -305,25 +308,17 @@ public:
         else
         {
 #endif
-
-#ifdef LFS
-            AsyncWebServerResponse *response = request->beginResponse(LittleFS, name, GetContentType(name), forceDownload);
+            AsyncWebServerResponse *response = request->beginResponse(LIONWIFI_FS, name, GetContentType(name), forceDownload);
             request->send(response);
-#endif
-#ifdef USE_SPIFFS
-            AsyncWebServerResponse *response = request->beginResponse(SPIFFS, name, GetContentType(name), forceDownload);
-            request->send(response);
-#endif
 #ifdef USE_SD_CARD
         }
 #endif
         Logger.UnlockFsSemaphore();
 
-        if (_logger)
-            _logger->Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: %s(%s)"), name, sd ? "Sd" : "SP");
+        Logger.Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: %s(%s)"), name, sd ? "Sd" : "SP");
         return true;
     }
-#else
+#else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
     bool SendFileResponse(const char *name, bool sd, bool tail, bool forceDownload = false)
     {
         if (!Logger.TryLockFsSemaphore()) // no-op (true) on ESP8266; real lock on ESP32+WebServer
@@ -338,18 +333,12 @@ public:
             dataFile = SD.open(name, SD_FILE_READ);
         else
 #endif
-#ifdef LFS
-            dataFile = LittleFS.open(name, "r");
-#endif
-#ifdef USE_SPIFFS
-        dataFile = SPIFFS.open(name, "r");
-#endif
+            dataFile = LIONWIFI_FS.open(name, "r");
 
         if (!dataFile)
         {
             Logger.UnlockFsSemaphore();
-            if (_logger)
-                _logger->Log_P(ILogger::LvlWarning, PSTR("sendFileResponse: %s file %s not found"), (sd ? F("SD") : F("SP")), name);
+            Logger.Log_P(ILogger::LvlWarning, PSTR("sendFileResponse: %s file %s not found"), (sd ? F("SD") : F("SP")), name);
             _server.send(404, __text_plain__F, String(F("Can't find ")) + (sd ? F("SD") : F("SP")) + F(" file ") + name);
             return false;
         }
@@ -382,17 +371,16 @@ public:
             _server.send(200, GetContentType(name), buf); // Content-Length = bytes sent
             delete[] buf;
             Logger.UnlockFsSemaphore();
-            if (_logger)
-                _logger->Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)read);
+            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)read);
             return true;
         }
         size_t sent = _server.streamFile(dataFile, GetContentType(name));
         dataFile.close();
         Logger.UnlockFsSemaphore();
 #ifndef LOG_FAVICON
-        if (_logger && strcasecmp_P(name, __slash_favicon_ico__P) != 0)
+        if (strcasecmp_P(name, __slash_favicon_ico__P) != 0)
 #endif
-            _logger->Log_P(ILogger::LvlDebug, PSTR("Sent %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)sent);
+            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)sent);
         return true;
     }
 #endif
@@ -402,7 +390,7 @@ public:
     {
         if (auth && !DoAuth(request))
             return false;
-#else
+#else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
     bool HandleFileRead(const String &path, bool auth = true) // send the right file to the client (if it exists)
     {
         if (auth && !DoAuth())
@@ -414,26 +402,18 @@ public:
             String name = path.substring(4);
             Logger.Log_P(ILogger::LvlDebug, PSTR("about to delete %s"), name.c_str());
 
-#ifdef LFS
-            if (LittleFS.exists(name))
-                LittleFS.remove(name);
-            else
-                return false;
-#endif
-#ifdef USE_SPIFFS
             bool del = false;
             if (Logger.TryLockFsSemaphore())
             {
-                if (SPIFFS.exists(name))
+                if (LIONWIFI_FS.exists(name))
                 {
-                    SPIFFS.remove(name);
+                    LIONWIFI_FS.remove(name);
                     del = true;
                 }
                 Logger.UnlockFsSemaphore();
             }
             if (!del)
                 return false;
-#endif
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
             request->redirect(F("/spiffs/ls"));
 #else
@@ -460,9 +440,9 @@ public:
             String folder;
             if (pos >= 0)
                 folder = name.substring(0, pos+1);
-            request->redirect(String("/sd/ls?folder=") + folder);
+            request->redirect(String(F("/sd/ls?folder=")) + folder);
 #else
-            _server.sendHeader("Location", "/sd/ls"); // Redirect the client to the success page
+            _server.sendHeader(F("Location"), F("/sd/ls")); // Redirect the client to the success page
             _server.send(303);
 #endif
             return true;
@@ -515,30 +495,17 @@ public:
     {
         if (!Logger.TryLockFsSemaphore())
             return;
-#ifdef LFS
 #ifdef ESP32
-        File dir = LittleFS.open("/");
-#else
-        Dir dir = LittleFS.openDir("/");
-#endif
-#endif
-#ifdef USE_SPIFFS
-#ifdef ESP32
-        File dir = SPIFFS.open("/");
-#else
-        Dir dir = SPIFFS.openDir("/");
-#endif
-#endif
-#ifdef ESP32
+        File dir = LIONWIFI_FS.open("/");
         File file;
         while (file = dir.openNextFile())
-#else
+#else // ESP8266 uses the Dir iterator API
+        Dir dir = LIONWIFI_FS.openDir("/");
         while (dir.next())
 #endif
         {
 #ifdef ESP32
             rtc_wdt_feed();
-            //Logger.Log_P(ILogger::LvlDebug, PSTR("Got %s, %ld bytes, %ld time"), file.name(), file.size(), file.getLastWrite());
             DirEntry entry(file.name());
             entry.size = file.size();
 #ifdef USE_FILE_TIME
@@ -554,14 +521,7 @@ public:
 #endif
             files += entry;
         }
-        Logger.Log_P(ILogger::LvlDebug, PSTR("Listed %d files from %S"), files.Length(),
-#ifdef LFS
-                     PSTR("LFS")
-#endif
-#ifdef USE_SPIFFS
-                         PSTR("SPIFFS")
-#endif
-        );
+        Logger.Log_P(ILogger::LvlDebug, PSTR("Listed %d files from %s"), files.Length(), LIONWIFI_FS_NAME);
         Logger.UnlockFsSemaphore();
     }
 
@@ -597,7 +557,6 @@ public:
         {
 #ifdef ESP32
             rtc_wdt_feed();
-            //Logger.Log_P(ILogger::LvlDebug, PSTR("Got %s, %ld bytes, %ld time"), file.name(), file.size(), file.getLastWrite());
             DirEntry entry(file.name());
             entry.size = file.size();
 #ifdef USE_FILE_TIME
@@ -666,25 +625,13 @@ public:
 #ifdef ESP32
             if (Logger.TryLockFsSemaphore())
             {
-#ifdef LFS
-                stats.freeSize = LittleFS.totalBytes() - LittleFS.usedBytes();
-                stats.totalSize = LittleFS.totalBytes();
-#endif
-#ifdef USE_SPIFFS
-                stats.freeSize = SPIFFS.totalBytes() - SPIFFS.usedBytes();
-                stats.totalSize = SPIFFS.totalBytes();
-#endif
+                stats.freeSize = LIONWIFI_FS.totalBytes() - LIONWIFI_FS.usedBytes();
+                stats.totalSize = LIONWIFI_FS.totalBytes();
                 Logger.UnlockFsSemaphore();
             }
-#else
-#ifdef LFS
+#else // ESP8266
             FSInfo fs_info;
-            LittleFS.info(fs_info);
-#endif
-#ifdef USE_SPIFFS
-            FSInfo fs_info;
-            SPIFFS.info(fs_info);
-#endif
+            LIONWIFI_FS.info(fs_info);
             stats.freeSize = fs_info.totalBytes - fs_info.usedBytes;
             stats.totalSize = fs_info.totalBytes;
 #endif
@@ -705,7 +652,7 @@ public:
             if (p->name() == "folder")
                 folder = p->value();
         }
-#else
+#else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
     void HandleLs(bool sd)
     {
 #if defined(ESP32)
@@ -823,8 +770,6 @@ public:
 
         if (!index)
         {
-#if defined(USE_SD_CARD) && defined(SDFAT)
-#endif
 #ifdef USE_SD_CARD
             if (sd)
             {
@@ -845,18 +790,10 @@ public:
 #endif
             {
                 Logger.Log_P(ILogger::LvlDebug, PSTR("ESPHandleFileUpload Name: %s"), filename.c_str());
-#ifdef LFS
                 if (filename.startsWith("/"))
-                    _fsUploadFile = LittleFS.open(filename, "w");
+                    _fsUploadFile = LIONWIFI_FS.open(filename, "w");
                 else
-                    _fsUploadFile = LittleFS.open(String(F("/")) + filename, "w"); // Open the file for writing in SPIFFS (create if it doesn't exist)
-#endif
-#ifdef USE_SPIFFS
-                if (filename.startsWith("/"))
-                    _fsUploadFile = SPIFFS.open(filename, "w");
-                else
-                    _fsUploadFile = SPIFFS.open(String(F("/")) + filename, "w"); // Open the file for writing in SPIFFS (create if it doesn't exist)
-#endif
+                    _fsUploadFile = LIONWIFI_FS.open(String(F("/")) + filename, "w"); // create if it doesn't exist
             }
         }
 #if defined(USE_SD_CARD) && defined(SDFAT)
@@ -889,7 +826,7 @@ public:
                     if (request->hasParam("folder"))
                         folder = request->getParam("folder")->value();
 
-                    request->redirect(String("/sd/ls?folder=")+folder); // Redirect the client to the success page
+                    request->redirect(String(F("/sd/ls?folder="))+folder); // Redirect the client to the success page
                 }
                 else
                     request->send(500, __text_plain__F, F("500: couldn't create file"));
@@ -900,14 +837,6 @@ public:
                 if (_fsUploadFile) // If the file was successfully created
                 {
                     _fsUploadFile.close(); // Close the file
-
-                    // reopen to get size
-                    // if (filename.startsWith("/"))
-                    //     _fsUploadFile = SPIFFS.open(filename);
-                    // else
-                    //     _fsUploadFile = SPIFFS.open(String(F("/")) + filename); // Open the file for writing in SPIFFS (create if it doesn't exist)
-                    // Logger.Log_P(ILogger::LvlDebug, PSTR("ESPHandleFileUpload Size: %ld"), _fsUploadFile.size());
-                    // _fsUploadFile.close(); // Close the file again
 #ifdef USE_SD_CARD
                     request->redirect(sd ? F("/sd/ls") : F("/spiffs/ls")); // Redirect the client to the success page
 #else
@@ -919,15 +848,13 @@ public:
             }
         }
     }
-#else
+#else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
     void HandleFileUpload(bool sd)
     {
-        //Logger.Log_P(ILogger::LvlDebug, PSTR("handleFileUpload SD = %d"), sd);
         if (!DoAuth())
             return;
 
         HTTPUpload &upload = _server.upload();
-        //Logger.Log_P(ILogger::LvlDebug, PSTR("handleFileUpload Status = %d"), upload.status);
         if (upload.status == UPLOAD_FILE_START)
         {
             String filename = upload.filename;
@@ -943,12 +870,7 @@ public:
                 if (!filename.startsWith("/"))
                     filename = "/" + filename;
                 Logger.Log_P(ILogger::LvlDebug, PSTR("handleFileUpload Name: %s"), filename.c_str());
-#ifdef LFS
-                _fsUploadFile = LittleFS.open(filename, "w"); // Open the file for writing in SPIFFS (create if it doesn't exist)
-#endif
-#ifdef USE_SPIFFS
-                _fsUploadFile = SPIFFS.open(filename, "w");   // Open the file for writing in SPIFFS (create if it doesn't exist)
-#endif
+                _fsUploadFile = LIONWIFI_FS.open(filename, "w"); // create if it doesn't exist
                 filename = String();
             }
         }
@@ -971,9 +893,9 @@ public:
                 _fsUploadFile.close(); // Close the file again
                 Logger.Log_P(ILogger::LvlDebug, PSTR("handleFileUpload Size: %d"), upload.totalSize);
 #ifdef USE_SD_CARD
-                _server.sendHeader("Location", sd ? "/sd/ls" : "/spiffs/ls"); // Redirect the client to the success page
+                _server.sendHeader(F("Location"), sd ? F("/sd/ls") : F("/spiffs/ls")); // Redirect the client to the success page
 #else
-                _server.sendHeader("Location", "/spiffs/ls"); // Redirect the client to the success page
+                _server.sendHeader(F("Location"), F("/spiffs/ls")); // Redirect the client to the success page
 #endif
                 _server.send(303);
             }
@@ -1006,7 +928,7 @@ public:
             request->send(500, __text_plain__F, String(F("Can't create folder ")) + name);
             return;
         }
-        request->redirect(String("/sd/ls?folder=")+folder);
+        request->redirect(String(F("/sd/ls?folder="))+folder);
     }
 #endif
 
@@ -1048,17 +970,12 @@ public:
             [this](AsyncWebServerRequest *request) { request->send(200); },                                                                                                                              // Send status 200 (OK) to tell the client we are ready to receive
             [this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) { HandleFileUpload(false, request, filename, index, data, len, final); } // Receive and save the file
         );
-#ifdef LFS
-        _server.serveStatic("/favicon.ico", LittleFS, "/favicon.ico");
-#endif
-#ifdef USE_SPIFFS
-        _server.serveStatic("/favicon.ico", SPIFFS, "/favicon.ico");
-#endif
+        _server.serveStatic("/favicon.ico", LIONWIFI_FS, "/favicon.ico");
         _server.onNotFound([this](AsyncWebServerRequest *request) {
             if (!HandleFileRead(request->url(), request))
                 request->send(404, __text_plain__F, F("404: Not Found")); // otherwise, respond with a 404 (Not Found) error
         });
-#else
+#else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
         _server.on(__slash_favicon_ico__F, [this]() { HandleFileRead(__slash_favicon_ico__F, false); });
         _server.on(F("/spiffs/ls"), HTTP_GET,
                    [this]() { HandleLs(false); });
@@ -1076,32 +993,15 @@ public:
         _server.on("/", [this]() { HandleFileRead(F("/index_nosd.html")); });
 #endif
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-    // Can't format here due to watchdog !
-//         _server.on("/format", HTTP_GET, [this](AsyncWebServerRequest *request) {
-//             if (!DoAuth(request)) return;
-//         Logger.Log_P(ILogger::LvlInfo, PSTR("Formatting Ffile system"));
-// #ifdef LFS
-//             LittleFS.format();
-//             request->send(200, __text_plain__F, "LittleFS Formatted");
-// #endif
-// #ifdef USE_SPIFFS
-//             SPIFFS.format();
-//             request->send(200, __text_plain__F, "SPIFFS Formatted");
-// #endif
-//         Logger.Log_P(ILogger::LvlInfo, PSTR("Format complete"));
-//     });
+    // NOTE: no "/format" route on the ESP32 async path — formatting the FS
+    // synchronously inside an async callback trips the task watchdog. Format
+    // out-of-band (e.g. over serial / OTA) on ESP32 async builds.
 #else
         _server.on(F("/format"), HTTP_GET, [this]() {
             if (!DoAuth()) return;
         Logger.Log_P(ILogger::LvlInfo, PSTR("Formatting file system"));
-#ifdef LFS
-            LittleFS.format();
-            _server.send(200, __text_plain__F, F("LittleFS Formatted"));
-#endif
-#ifdef USE_SPIFFS
-            SPIFFS.format();
-            _server.send(200, __text_plain__F, F("SPIFFS Formatted"));
-#endif
+            LIONWIFI_FS.format();
+            _server.send(200, __text_plain__F, F(LIONWIFI_FS_NAME " formatted"));
         Logger.Log_P(ILogger::LvlInfo, PSTR("Format complete"));
     });
 #endif

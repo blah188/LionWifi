@@ -18,14 +18,68 @@
 //        ESP32 + NO_ASYNC_WEB_SERVER: WebServer        server(80);
 //   * WifiConnector *_connector;     // extern'd at the bottom of this header
 //
-// ---- Required build flags:
-//   * Select a filesystem: -D USE_SPIFFS  (or -D LFS for LittleFS).
-//   * Override the web-auth credentials (defaults are admin/admin — CHANGE THEM):
-//        -D WEB_SERVER_AUTH_USER=\"...\"  -D WEB_SERVER_AUTH_PASSWORD=\"...\"
-//
 // ---- Dependencies (PlatformIO): LionArray, LionLogger, LionStreams; plus
 //      LionTask on ESP8266 / LionRtosTask on ESP32. The ESP32 async web path
 //      additionally needs ESPAsyncWebServer + AsyncTCP.
+//
+// ---- Compile-time configuration (define via build_flags). Required:
+//   USE_SPIFFS | LFS        Filesystem — define EXACTLY ONE (LFS = LittleFS).
+//
+//   Web auth (defaults admin/admin — OVERRIDE for real deployments):
+//   WEB_SERVER_AUTH_USER     Basic-auth user      (default "admin")
+//   WEB_SERVER_AUTH_PASSWORD Basic-auth password  (default "admin")
+//   NO_AUTH                  Disable HTTP auth entirely (open access).
+//
+//   Time / NTP:
+//   NTP_TZ_OFFSET_SEC        UTC offset in seconds (default 7*3600, no DST)
+//   NTP_SERVER               NTP host             (default "pool.ntp.org")
+//   MIN_VALID_EPOCH          "time is set" threshold (default 2019-01-01)
+//
+//   WiFi state machine (ms):
+//   WIFI_CONNECT_TIMEOUT     Per-AP attempt before rotating SSID (default 20000)
+//   WIFI_FATAL_CONNECT_TIMEOUT  Reboot after this long disconnected (default 180000)
+//   WIFI_CLIENT_TIMEOUT      Shared WiFi/HTTP client timeout      (default 3000)
+//   FORBID_WIFI_MONITOR      Disable the fatal-timeout auto-reboot.
+//   QUIET_WIFI_LOGS          Suppress the connect/reconnect/AP-change log lines.
+//
+//   Router ping watchdog (opt-in):
+//   PING_ROUTER              Router IP/host string — enables periodic TCP ping;
+//                            reboots after PING_ROUTER_MAX_FAILURES (default 4)
+//                            misses, every PING_ROUTER_INTERVAL ms (default 30000).
+//
+//   Logging / housekeeping (most gated by LionLogger features):
+//   LOG_CLEAR_EVERY_HOURS    Log-maintenance cadence (default 4)
+//   LOG_CLEAR_DAYS           Keep dated logs this many days (default 14)
+//   MAX_LOG_BYTES, LOG_CLEAR_FREE_SPACE, FS_LOW_SPACE_THRESHOLD/TARGET,
+//   FS_SPACE_CHECK_INTERVAL_MS                Free-space / size watchdog tuning.
+//   NO_MEMSTAT_IN_STATUS     Drop heap/frag stats from the status page.
+//   LOG_FAVICON              Also log favicon.ico requests.
+//
+//   ESP32-specific:
+//   NO_WIFI_TASK             Run Loop() from your loop() instead of a FreeRTOS task.
+//   NO_ASYNC_WEB_SERVER      Use the sync WebServer instead of ESPAsyncWebServer.
+//   CORE_WIFI                FreeRTOS core for the WiFi task (default 1).
+//   DISABLE_11N              Force 802.11b/g (some APs misbehave with 11n).
+//   MAX_WIFI_POWER           Set max TX power for weak links.
+//
+//   FsBrowser extras:
+//   USE_SD_CARD [+ SDFAT]    Also browse an SD card (SdFat when SDFAT is set).
+//   USE_FILE_TIME            Show created/modified timestamps in listings.
+//
+// ---- HTTP endpoints registered (see FsBrowser::AddRoutes + WifiConnector::Setup):
+//   GET /                         Home page (index.html w/ SD, else index_nosd.html)
+//   GET /spiffs/ls   POST upload  Filesystem listing + multipart file upload
+//   GET /tail/<f> /download/<f> /spiffs/<f>   View last 8 KB / download / raw file
+//   GET /del<f>                   Delete a file (then redirect to listing)
+//   GET /log /log/tail /spiffs/log[/tail]     LionLogger's current-day log file
+//                                 (full / last 8 KB). Added by WifiConnector::Setup,
+//                                 served via FsBrowser from Logger.GetLogFileName().
+//   GET /restart                  Reboot the device
+//   GET /format                   Format the FS (ESP8266 / ESP32-sync only)
+//   GET /logout                   Clear HTTP Basic auth (401)
+//   GET /favicon.ico              Served from the filesystem
+//   GET /lion-tasks               LionTask debug dump (ESP8266)
+//   GET /sd/ls /sd/tail/<f> /sd/download/<f> /sd/del/<f> /sd/mkdir   (USE_SD_CARD)
 //
 // Single-instance, non-copyable: owns OS handles (WiFiClient/HTTPClient), the
 // web routes and (on ESP32) a FreeRTOS task. Create one via `new` and assign it
@@ -64,8 +118,8 @@ extern "C"
 #include <ESP8266HTTPClient.h>
 #endif
 
-#include <MyOTA.h>
-#include <FsBrowser.h>
+#include <FsBrowser.h> // defines LIONWIFI_FS (the selected filesystem)
+#include <MyOTA.h>      // uses LIONWIFI_FS, so it must come after FsBrowser.h
 
 #ifndef LOG_CLEAR_EVERY_HOURS
 #define LOG_CLEAR_EVERY_HOURS 4
@@ -131,6 +185,8 @@ extern ESP8266WebServer server;
 #define WIFI_CLIENT_TIMEOUT 3000
 #endif
 
+// On ESP32 (unless NO_WIFI_TASK) the connector runs its own FreeRTOS task, so it
+// derives from RtosTask; everywhere else it is a plain pumped-from-loop() object.
 #if defined(ESP32) && !defined(NO_WIFI_TASK)
 class WifiConnector : RtosTask
 #else
@@ -420,15 +476,8 @@ public:
         FormatDateTime(startup, out);
         out.print(F("</b> (uptime <b>"));
         FormatTimespan(now - startup, out);
-        out.printf_P(PSTR("</b>)</span>&nbsp;<span>Built <b>%S %S</b></span>&nbsp;<span>SDK: <b>%S(%S)</b></span></div>"), F(__DATE__), F(__TIME__), SdkVersion(),
-#ifdef LFS
-            F("LFS")
-#elif defined(USE_SPIFFS)
-            F("SPIFFS")
-#else
-            F("???")
-#endif
-    );
+        out.printf_P(PSTR("</b>)</span>&nbsp;<span>Built <b>%S %S</b></span>&nbsp;<span>SDK: <b>%S(%s)</b></span></div>"),
+                     F(__DATE__), F(__TIME__), SdkVersion(), LIONWIFI_FS_NAME);
 
 #ifndef NO_MEMSTAT_IN_STATUS        
         // Memory stats
@@ -446,7 +495,7 @@ public:
 
     void Setup()
     {
-        _myOta = new MyOta(&Logger);
+        _myOta = new MyOta();
 
 #if defined(ESP32) && !defined(NO_WIFI_TASK)
         RtosTask::Setup("WiFi", CORE_WIFI);
@@ -463,6 +512,9 @@ public:
         _httpClient = new HTTPClient();
         _httpClient->setTimeout(WIFI_CLIENT_TIMEOUT);
 
+        // LionLogger integration: expose the current-day log file over HTTP
+        // (/log[/tail], /spiffs/log[/tail]) plus a /restart route. The generic
+        // file browser routes themselves are added by _fsBrowser->AddRoutes() below.
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
         server.on("/log/tail", HTTP_GET, [this](AsyncWebServerRequest *request)
                   {
@@ -484,7 +536,7 @@ public:
         server.on("/restart", HTTP_GET, [this](AsyncWebServerRequest *request)
                   {
             if (!_fsBrowser->DoAuth(request)) return;
-            request->send(200, "text/plain", "Restarting...");
+            request->send(200, __text_plain__F, F("Restarting..."));
             delay(100);
             ESP.restart(); });
 #else
@@ -520,7 +572,7 @@ public:
             ESP.restart(); });
 #endif
 
-        _fsBrowser = new FsBrowser(&Logger, server, WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
+        _fsBrowser = new FsBrowser(server, WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
         _fsBrowser->AddRoutes();
 
 #if !defined(ESP32) || defined(NO_WIFI_TASK)
@@ -769,7 +821,8 @@ protected:
         WiFi.persistent(false);
         WiFi.disconnect(true);
 #ifndef QUIET_WIFI_LOGS
-        Logger.Log_P(ILogger::LvlInfo, PSTR("Connecting to %s/%s"), _ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
+        // Never log the PSK — SSID only.
+        Logger.Log_P(ILogger::LvlInfo, PSTR("Connecting to %s"), _ssids[_curApIdx]->c_str());
 #endif
         WiFi.begin(_ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
     }
@@ -777,7 +830,8 @@ protected:
     {
         _lastConnectStartTime = millis();
 #ifndef QUIET_WIFI_LOGS
-        Logger.Log_P(ILogger::LvlInfo, PSTR("Reconnecting to %s/%s"), _ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
+        // Never log the PSK — SSID only.
+        Logger.Log_P(ILogger::LvlInfo, PSTR("Reconnecting to %s"), _ssids[_curApIdx]->c_str());
 #endif
         WiFi.begin(_ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
     }

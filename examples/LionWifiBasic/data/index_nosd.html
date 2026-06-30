@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<!--
+  Typical LionWifi home page. Upload this file to the device filesystem as
+  /index_nosd.html (SPIFFS/LittleFS). The "/" route serves it; the links below
+  point at the routes FsBrowser / WifiConnector register. Keep it small — it
+  lives on flash.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LionWifi device</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 40rem; }
+    h1 { font-size: 1.3rem; }
+    ul { line-height: 1.9; }
+    a { text-decoration: none; }
+    .danger { color: #b00; }
+    code { background: #f0f0f0; padding: 0 .3em; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>LionWifi device</h1>
+  <ul>
+    <li><a href="/spiffs/ls">Files</a> &mdash; browse / upload / download / delete</li>
+    <li><a href="/log">Log</a> &middot; <a href="/log/tail">Log (last 8&nbsp;KB)</a></li>
+    <li><a href="/restart" class="danger" onclick="return confirm('Reboot the device?')">Restart</a></li>
+    <li><a href="/logout">Log out</a></li>
+  </ul>
+  <p>Edit <code>/index_nosd.html</code> on the filesystem to customise this page.</p>
+</body>
+</html>
