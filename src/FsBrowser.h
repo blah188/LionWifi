@@ -67,6 +67,9 @@ extern SdFat SD;
 #include <Array.h>
 #include <Logger.h>
 #include <StringStream.h>
+#if !defined(ESP32) || defined(NO_ASYNC_WEB_SERVER)
+#include <ServerStream.h> // sync-server chunked streaming (not available for async)
+#endif
 
 #include "DirEntry.h"
 
@@ -672,95 +675,84 @@ public:
 
         qsort(files.GetData(), files.Length(), sizeof(DirEntry), DirEntrySort);
 
+        // Output sink: on the sync server stream the page in ~1 KB chunks via
+        // ServerStream (never holding the whole page); on the async server (no
+        // streaming Print) build one String, reserved up-front to limit realloc
+        // churn. Both are Print, so the row-building code below is shared.
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
         String buffer;
-        StringStream lsFile(buffer);
-#ifndef ESP32
-        _server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-#else
-        // ESP32 builds the whole page in one String before sending (the async
-        // server has no per-row chunking here). Reserve once up-front so it grows
-        // in a single allocation instead of churning/fragmenting the heap; rows
-        // average ~180 B. (A true streaming fix would need beginChunkedResponse.)
-        buffer.reserve(512 + (size_t)files.Length() * 180);
+        buffer.reserve(512 + (size_t)files.Length() * 180); // ~180 B/row
+        StringStream out(buffer);
         rtc_wdt_feed();
+#else
+        _server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+        _server.send_P(200, __text_html__P, PSTR(""));
+        ServerStream out(_server);
 #endif
-        lsFile.printf_P(PSTR("<html> <body> <form method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"> <input class=\"button\" type=\"submit\" value=\"Upload\"></form>"));
+        out.printf_P(PSTR("<html> <body> <form method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"> <input class=\"button\" type=\"submit\" value=\"Upload\"></form>"));
 #if defined(USE_SD_CARD) && defined (SDFAT)
         if (sd)
-            lsFile.printf_P(PSTR("<form><label for=\"dir\">Create folder:</label><input type=\"text\" id=\"dir\"><input type=\"button\" value=\"Create\" onclick=\"mkdir()\"></form>"));
+            out.printf_P(PSTR("<form><label for=\"dir\">Create folder:</label><input type=\"text\" id=\"dir\"><input type=\"button\" value=\"Create\" onclick=\"mkdir()\"></form>"));
 #endif
-        lsFile.printf_P(PSTR("<table><tr><td><b>Name</b></td></td><td><b>Size</b></td>"));
+        out.printf_P(PSTR("<table><tr><td><b>Name</b></td></td><td><b>Size</b></td>"));
 #ifdef USE_FILE_TIME
-        lsFile.printf_P(PSTR("<td><b>Created</b></td><td><b>Modified</b></td>"));
+        out.printf_P(PSTR("<td><b>Created</b></td><td><b>Modified</b></td>"));
 #endif
-        lsFile.printf_P(PSTR("<td><b>Action</b></td></tr>\n"));
-
-#ifndef ESP32
-        _server.send_P(200, __text_html__P, PSTR(""));
-        _server.sendContent(buffer);
-        lsFile.reset();
-#endif
+        out.printf_P(PSTR("<td><b>Action</b></td></tr>\n"));
 
         for (int i = 0; i < files.Length(); i++)
         {
             DirEntry entry = files[i];
 
             if (entry.isFolder)
-                lsFile.printf_P(PSTR("<tr> <td> <a href=\"/sd/ls?folder=%s/\">%s</a></td><td>%s</td><td>DIR</td>"),
-                                entry.fullName, entry.fullName, FileSize(entry.size).c_str());
+                out.printf_P(PSTR("<tr> <td> <a href=\"/sd/ls?folder=%s/\">%s</a></td><td>%s</td><td>DIR</td>"),
+                             entry.fullName, entry.fullName, FileSize(entry.size).c_str());
             else
-                lsFile.printf_P(PSTR("<tr> <td> <a href=\"%s\">%s</a></td><td>%s</td>"),
-                                entry.fullName, entry.fullName, FileSize(entry.size).c_str());
+                out.printf_P(PSTR("<tr> <td> <a href=\"%s\">%s</a></td><td>%s</td>"),
+                             entry.fullName, entry.fullName, FileSize(entry.size).c_str());
 #ifdef USE_FILE_TIME
-            lsFile.printf_P(PSTR("<td><font size=\"-1\">%s</font></td><td><font size=\"-1\">%s</font></td>"),
-                            FileTime(entry.creationTime).c_str(), FileTime(entry.writeTime).c_str());
+            out.printf_P(PSTR("<td><font size=\"-1\">%s</font></td><td><font size=\"-1\">%s</font></td>"),
+                         FileTime(entry.creationTime).c_str(), FileTime(entry.writeTime).c_str());
 #endif
             if (entry.isFolder)
-                lsFile.printf_P(PSTR("<td></td></tr>"));
+                out.printf_P(PSTR("<td></td></tr>"));
             else
             {
                 if (sd)
-                {
-                    lsFile.printf_P(PSTR("<td><a href=\"/sd/tail/%s\">Tail</a>&nbsp<a href=\"/sd/download/%s\">Download</a>&nbsp<a href=\"/sd/del/%s\""),
-                                    entry.fullName, entry.fullName, entry.fullName);
-                }
+                    out.printf_P(PSTR("<td><a href=\"/sd/tail/%s\">Tail</a>&nbsp<a href=\"/sd/download/%s\">Download</a>&nbsp<a href=\"/sd/del/%s\""),
+                                 entry.fullName, entry.fullName, entry.fullName);
                 else
-                    lsFile.printf_P(PSTR("<td><a href=\"/tail/%s\">Tail</a>&nbsp<a href=\"/download/%s\">Download</a>&nbsp<a href=\"/del/%s\""),
-                                    entry.fullName, entry.fullName, entry.fullName);
-                lsFile.printf_P(PSTR(" onclick=\"return confirm('Are you sure to delete %s?')\">DEL</a></td></tr>"), entry.fullName);
+                    out.printf_P(PSTR("<td><a href=\"/tail/%s\">Tail</a>&nbsp<a href=\"/download/%s\">Download</a>&nbsp<a href=\"/del/%s\""),
+                                 entry.fullName, entry.fullName, entry.fullName);
+                out.printf_P(PSTR(" onclick=\"return confirm('Are you sure to delete %s?')\">DEL</a></td></tr>"), entry.fullName);
             }
-#ifndef ESP32
-            _server.sendContent(buffer);
-            lsFile.reset();
-#else
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
             rtc_wdt_feed();
 #endif
         }
 
         FileSystemStats stats = GetFsStats(sd);
-        lsFile.printf_P(PSTR("<tr><td>Total:</td><td>%s</td><td></td></tr>\n<tr><td>Free:</td><td>%s</td><td></td></tr>\n</table> <a href=\"/\">Home</a></body>"),
-                        FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
+        out.printf_P(PSTR("<tr><td>Total:</td><td>%s</td><td></td></tr>\n<tr><td>Free:</td><td>%s</td><td></td></tr>\n</table> <a href=\"/\">Home</a></body>"),
+                     FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
 
 #if defined(USE_SD_CARD) && defined (SDFAT)
         if (sd)
-        {
-            lsFile.printf_P(PSTR("<script>function mkdir() { var folder = (getParameterByName('folder')?getParameterByName('folder'):\"/\"); window.location = \"/sd/mkdir?name=\" + folder + document.getElementById('dir').value+\"&folder=\"+folder;}function getParameterByName(name, url = window.location.href) {name = name.replace(/[\\[\\]]/g, '\\\\$&');var regex = new RegExp('[?&]' + name + '(=([^&#]*)|&|#|$)'), results = regex.exec(url); if (!results) return null; if (!results[2]) return ''; return decodeURIComponent(results[2].replace(/\\+/g, ' '));}</script>"));
-        }
+            out.printf_P(PSTR("<script>function mkdir() { var folder = (getParameterByName('folder')?getParameterByName('folder'):\"/\"); window.location = \"/sd/mkdir?name=\" + folder + document.getElementById('dir').value+\"&folder=\"+folder;}function getParameterByName(name, url = window.location.href) {name = name.replace(/[\\[\\]]/g, '\\\\$&');var regex = new RegExp('[?&]' + name + '(=([^&#]*)|&|#|$)'), results = regex.exec(url); if (!results) return null; if (!results[2]) return ''; return decodeURIComponent(results[2].replace(/\\+/g, ' '));}</script>"));
 #endif
-        lsFile.printf_P(PSTR("</html>"));
+        out.printf_P(PSTR("</html>"));
 
-#ifndef ESP32
-        _server.sendContent(buffer);
-        _server.chunkedResponseFinalize();
-        lsFile.reset();
-        Logger.Log_P(ILogger::LvlDebug, PSTR("Fully sent LS content, free mem = %ld"), system_get_free_heap_size());
-#else
-#ifdef NO_ASYNC_WEB_SERVER
-        _server.sendContent(buffer);
-#else
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
         request->send(200, __text_html__F, buffer);
-#endif
         Logger.Log_P(ILogger::LvlDebug, PSTR("Fully sent LS content, free mem = %ld"), esp_get_free_heap_size());
+#else
+        out.flush(); // emit the final partial chunk
+#ifdef ESP32
+        _server.sendContent(""); // ESP32 WebServer: terminate the chunked response
+        Logger.Log_P(ILogger::LvlDebug, PSTR("Fully sent LS content, free mem = %ld"), esp_get_free_heap_size());
+#else
+        _server.chunkedResponseFinalize(); // ESP8266: terminate the chunked response
+        Logger.Log_P(ILogger::LvlDebug, PSTR("Fully sent LS content, free mem = %ld"), system_get_free_heap_size());
+#endif
 #endif
     }
 
