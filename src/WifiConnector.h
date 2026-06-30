@@ -459,12 +459,14 @@ public:
 #else
         uint32_t freeHeap = ESP.getFreeHeap();
         uint32_t maxAlloc = ESP.getMaxAllocHeap();
-        // Clamp the ratio to <=100 so frag never wraps to a bogus >100% value
-        // (maxAlloc can momentarily exceed the free-heap accounting).
-        uint32_t allocRatio = freeHeap > 0 ? (uint32_t)maxAlloc * 100 / freeHeap : 100;
-        if (allocRatio > 100)
-            allocRatio = 100;
-        uint8_t frag = (uint8_t)(100 - allocRatio);
+        // On ESP32 the heap is segmented (WiFi/BT/RTOS allocations split DRAM),
+        // so the largest contiguous block is naturally a fraction of free heap
+        // even at boot — reporting it as "fragmentation %" is misleading. Show
+        // the largest block and its share of free heap instead. Clamp the share
+        // to <=100 (maxAlloc can momentarily exceed the free-heap accounting).
+        uint32_t largestPct = freeHeap > 0 ? (uint32_t)maxAlloc * 100 / freeHeap : 100;
+        if (largestPct > 100)
+            largestPct = 100;
 #endif
 #endif
 
@@ -486,8 +488,8 @@ public:
         out.printf_P(PSTR("Heap: <b>%u</b>B (loop min <b>%u</b>) | Frag: <b>%d%%</b> | Stack: <b>%u</b>B"),
                       freeHeap, _minFreeMemory, frag, freeStack);
 #else
-        out.printf_P(PSTR("Heap: <b>%u</b>B (min <b>%u</b>) | Frag: <b>%d%%</b>"),
-                      freeHeap, _minFreeMemory, frag);
+        out.printf_P(PSTR("Heap: <b>%u</b>B (min <b>%u</b>) | Largest: <b>%s</b> (%u%%)"),
+                      freeHeap, _minFreeMemory, FsBrowser::FileSize(maxAlloc).c_str(), largestPct);
 #endif
         out.print(F("</div><br>"));
 #endif
