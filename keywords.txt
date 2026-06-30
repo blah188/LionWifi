@@ -1,0 +1,67 @@
+#######################################
+# Syntax Coloring Map for LionWifi
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+WifiConnector	KEYWORD1
+FsBrowser	KEYWORD1
+MyOta	KEYWORD1
+DirEntry	KEYWORD1
+FileSystemStats	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+Setup	KEYWORD2
+Loop	KEYWORD2
+Connected	KEYWORD2
+TimeSet	KEYWORD2
+IsOn	KEYWORD2
+TurnOn	KEYWORD2
+SetPingTime	KEYWORD2
+GetPingTime	KEYWORD2
+GetMinFreeMemory	KEYWORD2
+GetStartupTime	KEYWORD2
+Browser	KEYWORD2
+RegisterConnectedEvent	KEYWORD2
+RegisterDisconnectedEvent	KEYWORD2
+RegisterTimeSetEvent	KEYWORD2
+RegisterClearLogEvent	KEYWORD2
+RegisterPingEvent	KEYWORD2
+SharedWifiClient	KEYWORD2
+SharedHttpClient	KEYWORD2
+StopSharedWifiClient	KEYWORD2
+StatusHtml	KEYWORD2
+FormatTime	KEYWORD2
+FormatDateTime	KEYWORD2
+FormatTimespan	KEYWORD2
+SdkVersion	KEYWORD2
+ResetReason	KEYWORD2
+GetRouterPingErrorsInRow	KEYWORD2
+GetRouterPingSuccessesInRow	KEYWORD2
+AddRoutes	KEYWORD2
+HandleFileRead	KEYWORD2
+HandleLs	KEYWORD2
+SendFileResponse	KEYWORD2
+DoAuth	KEYWORD2
+GetContentType	KEYWORD2
+GetFsStats	KEYWORD2
+Begin	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+WEB_SERVER_AUTH_USER	LITERAL1
+WEB_SERVER_AUTH_PASSWORD	LITERAL1
+WIFI_CONNECT_TIMEOUT	LITERAL1
+WIFI_FATAL_CONNECT_TIMEOUT	LITERAL1
+NTP_TZ_OFFSET_SEC	LITERAL1
+NTP_SERVER	LITERAL1
+PING_ROUTER	LITERAL1
+USE_SPIFFS	LITERAL1
+LFS	LITERAL1
