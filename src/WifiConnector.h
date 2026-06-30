@@ -1,5 +1,39 @@
 #pragma once
 
+// =============================================================================
+// LionWifi — WiFi connection manager + ArduinoOTA + web file browser (FsBrowser)
+// + status/uptime page, for ESP8266 and ESP32 (Arduino framework).
+//
+// Pumps the WiFi state machine: connects to the first reachable of up to three
+// SSIDs, auto-reconnects, rotates APs on timeout, (optionally) pings the router
+// and reboots on a wedged link, sets time over NTP, rotates logs, and serves a
+// SPIFFS/LittleFS/SD file browser with OTA. Fires user callbacks on connect /
+// disconnect / time-set / log-clear / ping.
+//
+// ---- Required globals the CONSUMER must define (this header only declares them):
+//   * MyLogger Logger(...);          // from LionLogger; .Setup() called by you
+//   * <WebServerType> server(80);    // the web server, extern'd below:
+//        ESP8266:                     ESP8266WebServer server(80);
+//        ESP32 (default, async):      AsyncWebServer   server(80);  // ESPAsyncWebServer
+//        ESP32 + NO_ASYNC_WEB_SERVER: WebServer        server(80);
+//   * WifiConnector *_connector;     // extern'd at the bottom of this header
+//
+// ---- Required build flags:
+//   * Select a filesystem: -D USE_SPIFFS  (or -D LFS for LittleFS).
+//   * Override the web-auth credentials (defaults are admin/admin — CHANGE THEM):
+//        -D WEB_SERVER_AUTH_USER=\"...\"  -D WEB_SERVER_AUTH_PASSWORD=\"...\"
+//
+// ---- Dependencies (PlatformIO): LionArray, LionLogger, LionStreams; plus
+//      LionTask on ESP8266 / LionRtosTask on ESP32. The ESP32 async web path
+//      additionally needs ESPAsyncWebServer + AsyncTCP.
+//
+// Single-instance, non-copyable: owns OS handles (WiFiClient/HTTPClient), the
+// web routes and (on ESP32) a FreeRTOS task. Create one via `new` and assign it
+// to the global `_connector`.
+// =============================================================================
+
+#include <functional>
+
 #include <Logger.h>
 #include <Array.h>
 
@@ -36,7 +70,6 @@ extern "C"
 
 #include <MyOTA.h>
 #include <FsBrowser.h>
-#include <nonstd.h>
 
 #ifndef LOG_CLEAR_EVERY_HOURS
 #define LOG_CLEAR_EVERY_HOURS 4
@@ -62,12 +95,15 @@ extern "C"
 #define PING_ROUTER_MAX_FAILURES 4
 #endif
 
+// Default web-auth credentials. These are intentionally generic placeholders —
+// OVERRIDE THEM with -D WEB_SERVER_AUTH_USER=\"...\" / -D WEB_SERVER_AUTH_PASSWORD=\"...\"
+// for any real deployment. (Auth can be disabled entirely with -D NO_AUTH.)
 #ifndef WEB_SERVER_AUTH_USER
-#define WEB_SERVER_AUTH_USER "leva"
+#define WEB_SERVER_AUTH_USER "admin"
 #endif
 
 #ifndef WEB_SERVER_AUTH_PASSWORD
-#define WEB_SERVER_AUTH_PASSWORD "blah18"
+#define WEB_SERVER_AUTH_PASSWORD "admin"
 #endif
 
 #ifdef ESP32
@@ -138,7 +174,7 @@ private:
     int _curApIdx = 0;
     uint32_t _minFreeMemory = 1000000;
     FsBrowser *_fsBrowser;
-    nonstd::function<void()> _conEvent, _disconEvent, _timeSetEvent, _clearLogEvent, _pingEvent;
+    std::function<void()> _conEvent, _disconEvent, _timeSetEvent, _clearLogEvent, _pingEvent;
     WiFiClient *_client;
     HTTPClient *_httpClient;
 
@@ -181,23 +217,29 @@ public:
         }
     }
 
-    void RegisterConnectedEvent(nonstd::function<void()> evt)
+    // Single-instance manager: owns raw new'd handles (WiFiClient/HTTPClient/
+    // MyOta/FsBrowser) and registered web routes with no destructor, so a copy
+    // would alias and double-manage them. Non-copyable by design.
+    WifiConnector(const WifiConnector &) = delete;
+    WifiConnector &operator=(const WifiConnector &) = delete;
+
+    void RegisterConnectedEvent(std::function<void()> evt)
     {
         _conEvent = evt;
     }
-    void RegisterDisconnectedEvent(nonstd::function<void()> evt)
+    void RegisterDisconnectedEvent(std::function<void()> evt)
     {
         _disconEvent = evt;
     }
-    void RegisterTimeSetEvent(nonstd::function<void()> evt)
+    void RegisterTimeSetEvent(std::function<void()> evt)
     {
         _timeSetEvent = evt;
     }
-    void RegisterClearLogEvent(nonstd::function<void()> evt)
+    void RegisterClearLogEvent(std::function<void()> evt)
     {
         _clearLogEvent = evt;
     }
-    void RegisterPingEvent(nonstd::function<void()> evt)
+    void RegisterPingEvent(std::function<void()> evt)
     {
         _pingEvent = evt;
     }
