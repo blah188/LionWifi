@@ -85,9 +85,11 @@ void setup()
         _connector->StatusHtml(out);
         out.print(F("<p><a href=\"/spiffs/ls\">files</a> &middot; <a href=\"/log/tail\">log</a></p>"));
         out.print(F("</body></html>"));
-        out.flush(); // send the final partial chunk
-#ifndef ESP32
-        server.chunkedResponseFinalize(); // ESP8266: terminate the chunked response
+        out.flush(); // send the final partial chunk, then terminate the response
+#ifdef ESP32
+        server.sendContent("");            // ESP32 WebServer: terminating "0\r\n\r\n" chunk
+#else
+        server.chunkedResponseFinalize();  // ESP8266
 #endif
     });
 }

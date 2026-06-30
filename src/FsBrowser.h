@@ -685,8 +685,17 @@ public:
         StringStream out(buffer);
         rtc_wdt_feed();
 #else
+        // Canonical chunked-response start: CONTENT_LENGTH_UNKNOWN makes
+        // _prepareHeader() emit "Transfer-Encoding: chunked", and send() with an
+        // empty String writes ONLY the headers (it sends a body just `if
+        // (content.length())`). ServerStream then streams the chunks; the
+        // terminating "0\r\n\r\n" is written at the end (sendContent("") /
+        // chunkedResponseFinalize()).
+        // NB: must be send(), NOT send_P(..., PSTR("")) — send_P() unconditionally
+        // forwards to sendContent_P(), which on ESP32 emits the terminating chunk
+        // for an empty body and closes the stream (→ blank page).
         _server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-        _server.send_P(200, __text_html__P, PSTR(""));
+        _server.send(200, __text_html__F, "");
         ServerStream out(_server);
 #endif
         out.printf_P(PSTR("<html> <body> <form method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"> <input class=\"button\" type=\"submit\" value=\"Upload\"></form>"));
