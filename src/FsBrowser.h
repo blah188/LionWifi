@@ -50,11 +50,20 @@
 
 #ifdef USE_SD_CARD
 #ifdef SDFAT
+// SdFat streaming on the web uses the async server's chunked response (FsFile is
+// not an fs::FS). The sync WebServer / ESP8266 paths use the core `File` type and
+// can't hold an FsFile — so SDFAT is only supported on the ESP32 async server.
+#if !defined(ESP32) || defined(NO_ASYNC_WEB_SERVER)
+#error "LionWifi: SDFAT is supported only on the ESP32 async web server (the default). For ESP8266 or -D NO_ASYNC_WEB_SERVER, use the Arduino SD library (USE_SD_CARD without SDFAT)."
+#endif
 #include <SdFat.h>
 extern SdFat SD;
 #define SD_FILE_READ O_RDONLY
 #define SD_FILE_WRITE (O_RDWR | O_CREAT | O_AT_END)
-#define MySdFile File32
+// FsFile is the default SdFat (SdFs) file type — handles FAT16/FAT32 AND exFAT.
+// It's a concrete class (unlike the `File` alias), so it never clashes with the
+// core's fs::File. Build SdFat in its default mode (SDFAT_FILE_TYPE=3).
+#define MySdFile FsFile
 #else
 #include <SPI.h>
 #include <SD.h>
@@ -69,6 +78,9 @@ extern SdFat SD;
 #include <StringStream.h>
 #if !defined(ESP32) || defined(NO_ASYNC_WEB_SERVER)
 #include <ServerStream.h> // sync-server chunked streaming (not available for async)
+#endif
+#if defined(USE_SD_CARD) && defined(SDFAT) && defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+#include <memory> // shared_ptr keeps the SdFat file alive across async chunked sends
 #endif
 
 #include "DirEntry.h"
@@ -86,9 +98,6 @@ struct FileSystemStats
 };
 
 int DirEntrySort(const void *cmp1, const void *cmp2);
-#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-void DebugDumpRequest(AsyncWebServerRequest *request);
-#endif
 
 class FsBrowser
 {
@@ -107,9 +116,15 @@ private:
     bool _doAuth = false;
     const char *_username = nullptr, *_password = nullptr;
 #if defined(USE_SD_CARD) && defined(SDFAT)
-    File32 _fsSdUploadFile;
+    FsFile _fsSdUploadFile;
 #endif
     File _fsUploadFile;
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+    // Async uploads: the onUpload callback may not send the HTTP response (only
+    // the onRequest callback, which runs last, may). So onUpload records the
+    // outcome here and the route's onRequest handler turns it into a redirect/500.
+    bool _uploadOk = false;
+#endif
 
 public:
     // `server` is the consumer's web server (type varies by platform/build).
@@ -157,6 +172,32 @@ public:
         else if (filename.endsWith(".gz"))
             return F("application/x-gzip");
         return __text_plain__F;
+    }
+
+    // Percent-encode a filename for use inside an href, so spaces / UTF-8 bytes /
+    // reserved chars ('#', '?', '&', …) yield a valid URL. '/' and unreserved
+    // chars pass through. (The cores expose urlDecode() but no urlEncode().)
+    // Decoding back to the real name happens server-side: the sync WebServer
+    // leaves uri() percent-encoded so we urlDecode() it in onNotFound; the async
+    // server already decodes request->url().
+    static String UrlEncode(const char *s)
+    {
+        static const char hex[] = "0123456789ABCDEF";
+        String out;
+        for (; *s; s++)
+        {
+            unsigned char c = (unsigned char)*s;
+            if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                c == '-' || c == '_' || c == '.' || c == '~' || c == '/')
+                out += (char)c;
+            else
+            {
+                out += '%';
+                out += hex[c >> 4];
+                out += hex[c & 0x0F];
+            }
+        }
+        return out;
     }
 
     static String FileSize(uint64_t size)
@@ -249,43 +290,39 @@ public:
             request->send(404, __text_plain__F, String(F("Can't find ")) + (sd ? F("SD") : F("SP")) + F(" file ") + name);
             return false;
         }
-#if defined(USE_SD_CARD) && defined(SDFAT)
-        File32 sdDataFile;
-#endif
-        File dataFile;
-        if (tail) // Only tail
+        if (tail) // Only tail — read the last TailSize bytes into buf
         {
             char *buf = new char[TailSize + 1];
+            if (!buf)
+            {
+                Logger.UnlockFsSemaphore();
+                request->send(500, __text_plain__F, F("500: out of memory"));
+                return false;
+            }
+            size_t read = 0;
 #ifdef USE_SD_CARD
             if (sd)
             {
                 String sdPath = name;
-                if (sdPath.length() > 0 && sdPath[0] != '/') {
+                if (sdPath.length() > 0 && sdPath[0] != '/')
                     sdPath = "/" + sdPath;
-                }
-#ifdef SDFAT
-                sdDataFile = SD.open(sdPath.c_str(), SD_FILE_READ);
-#else
-                dataFile = SD.open(sdPath.c_str(), SD_FILE_READ);
-#endif
+                MySdFile f = SD.open(sdPath.c_str(), SD_FILE_READ);
+                if (f.size() > TailSize)
+                    f.seek(f.size() - TailSize);
+                read = f.readBytes(buf, TailSize);
+                f.close();
             }
             else
 #endif
-                dataFile = LIONWIFI_FS.open(name, "r");
-
-#if defined(USE_SD_CARD) && defined(SDFAT)
-            if (sdDataFile.size() > TailSize)
-                sdDataFile.seek(sdDataFile.size() - TailSize);
-            size_t read = sdDataFile.readBytes(buf, TailSize);
-            sdDataFile.close();
-#else
-            uint32_t tailPos = dataFile.size() > TailSize ? dataFile.size() - TailSize : 0;
-            if (tailPos)
-                dataFile.seek(tailPos);
-            size_t read = dataFile.readBytes(buf, TailSize);
-            Logger.Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: sending %u tail bytes (from pos %lu) of file %s"), (unsigned)read, (unsigned long)tailPos, name);
-            dataFile.close();
-#endif
+            {
+                File f = LIONWIFI_FS.open(name, "r");
+                uint32_t tailPos = f.size() > TailSize ? f.size() - TailSize : 0;
+                if (tailPos)
+                    f.seek(tailPos);
+                read = f.readBytes(buf, TailSize);
+                Logger.Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: sending %u tail bytes (from pos %lu) of file %s"), (unsigned)read, (unsigned long)tailPos, name);
+                f.close();
+            }
             buf[read] = 0;
             request->send(200, __text_plain__F, buf);
             delete[] buf;
@@ -296,14 +333,32 @@ public:
 #ifdef USE_SD_CARD
         if (sd)
         {
-#ifdef SDFAT
-            sdDataFile = SD.open(name, SD_FILE_READ);
-#else
-            //dataFile = SD.open(name, SD_FILE_READ);
             String sdPath = name;
-            if (sdPath.length() > 0 && sdPath[0] != '/') {
+            if (sdPath.length() > 0 && sdPath[0] != '/')
                 sdPath = "/" + sdPath;
+#ifdef SDFAT
+            // SdFat's FsFile is not an fs::FS, so beginResponse(FS,...) can't serve
+            // it. Stream via a chunked response; the file lives in a shared_ptr
+            // captured by the filler, so it is closed when the stream finishes OR
+            // the client aborts (the response and its captured copy are destroyed).
+            auto f = std::make_shared<FsFile>();
+            if (!f->open(sdPath.c_str(), O_RDONLY))
+            {
+                Logger.UnlockFsSemaphore();
+                request->send(500, __text_plain__F, F("500: SD open failed"));
+                return false;
             }
+            AsyncWebServerResponse *response = request->beginChunkedResponse(GetContentType(name),
+                [f](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
+                {
+                    (void)index;
+                    int n = f->read(buffer, maxLen);
+                    return n > 0 ? (size_t)n : 0;
+                });
+            if (forceDownload)
+                response->addHeader(F("Content-Disposition"), String(F("attachment; filename=")) + (name[0] == '/' ? name + 1 : name));
+            request->send(response);
+#else
             AsyncWebServerResponse *response = request->beginResponse(SD, sdPath.c_str(), GetContentType(name), forceDownload);
             request->send(response);
 #endif
@@ -333,7 +388,12 @@ public:
 
 #ifdef USE_SD_CARD
         if (sd)
-            dataFile = SD.open(name, SD_FILE_READ);
+        {
+            // Normalize a leading '/' — the SD VFS needs it, and /sd/tail strips
+            // the slash (substring(9)) while /sd/download keeps it.
+            String sdPath = (name[0] == '/') ? String(name) : (String('/') + name);
+            dataFile = SD.open(sdPath.c_str(), SD_FILE_READ);
+        }
         else
 #endif
             dataFile = LIONWIFI_FS.open(name, "r");
@@ -438,13 +498,9 @@ public:
                 SD.remove(sdPath.c_str());
             else
                 return false;
-#ifdef ESP32
-            int pos = name.lastIndexOf('/');
-            String folder;
-            if (pos >= 0)
-                folder = name.substring(0, pos+1);
-            request->redirect(String(F("/sd/ls?folder=")) + folder);
-#else
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER) // async: `request` exists
+            request->redirect(F("/sd/ls"));
+#else // sync (ESP8266 or ESP32 + NO_ASYNC_WEB_SERVER): no `request`
             _server.sendHeader(F("Location"), F("/sd/ls")); // Redirect the client to the success page
             _server.send(303);
 #endif
@@ -454,14 +510,14 @@ public:
         if (path.startsWith("/sd/tail"))
             return SendFileResponse(path.substring(9).c_str(), request, true, true);
         if (path.startsWith("/sd/download"))
-            return SendFileResponse(path.substring(12).c_str(), request, true, true, true);
+            return SendFileResponse(path.substring(12).c_str(), request, true, false, true); // full file, as attachment
         if (path.startsWith("/sd"))
             return SendFileResponse(path.substring(3).c_str(), request, true, false);
 #else
         if (path.startsWith("/sd/tail"))
             return SendFileResponse(path.substring(9).c_str(), true, true);
         if (path.startsWith("/sd/download"))
-            return SendFileResponse(path.substring(12).c_str(), true, true, true);
+            return SendFileResponse(path.substring(12).c_str(), true, false, true); // full file, as attachment
         if (path.startsWith("/sd"))
             return SendFileResponse(path.substring(3).c_str(), true, false);
 #endif
@@ -528,13 +584,13 @@ public:
         Logger.UnlockFsSemaphore();
     }
 
-    void ListSdFiles(Array<DirEntry> &files, const char *folder)
+    void ListSdFiles(Array<DirEntry> &files)
     {
 #ifdef USE_SD_CARD
 #ifdef SDFAT
         Logger.Log_P(ILogger::LvlDebug, PSTR("Using SDFAT"));
-        SdFile dir, file;
-        if (dir.open(folder[0] ? folder : "/"))
+        FsFile dir, file;
+        if (dir.open("/"))
         {
             while (file.openNext(&dir, O_RDONLY))
             {
@@ -580,8 +636,8 @@ public:
                 DirEntry entry(file.fullName());
                 entry.size = file.size();
 #ifdef USE_FILE_TIME
-                entry.creationTime = file.getCreationTime();
-                entry.writeTime = file.getLastWrite();
+                // ESP8266 fs::File has no getCreationTime(); use last-write for both.
+                entry.creationTime = entry.writeTime = file.getLastWrite();
 #endif
                 files += entry;
             }
@@ -646,15 +702,8 @@ public:
     void HandleLs(AsyncWebServerRequest *request, bool sd)
     {
         Logger.Log_P(ILogger::LvlDebug, PSTR("Got LS request, SD = %d, free mem = %ld"), (int)sd,  esp_get_free_heap_size());
-        String folder;
         if (!DoAuth(request))
             return;
-        for (int i = 0; i < request->params(); i++)
-        {
-            auto p = request->getParam(i);
-            if (p->name() == "folder")
-                folder = p->value();
-        }
 #else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
     void HandleLs(bool sd)
     {
@@ -669,7 +718,7 @@ public:
 #endif
         Array<DirEntry> files;
         if (sd)
-            ListSdFiles(files, ""/*folder.c_str()*/);
+            ListSdFiles(files); // SD listing is flat (root only)
         else
             ListSpiffsFiles(files);
 
@@ -698,11 +747,7 @@ public:
         _server.send(200, __text_html__F, "");
         ServerStream out(_server);
 #endif
-        out.printf_P(PSTR("<html> <body> <form method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"> <input class=\"button\" type=\"submit\" value=\"Upload\"></form>"));
-#if defined(USE_SD_CARD) && defined (SDFAT)
-        if (sd)
-            out.printf_P(PSTR("<form><label for=\"dir\">Create folder:</label><input type=\"text\" id=\"dir\"><input type=\"button\" value=\"Create\" onclick=\"mkdir()\"></form>"));
-#endif
+        out.printf_P(PSTR("<!doctype html><html><head><meta charset=\"utf-8\"></head><body> <form method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"> <input class=\"button\" type=\"submit\" value=\"Upload\"></form>"));
         out.printf_P(PSTR("<table><tr><td><b>Name</b></td></td><td><b>Size</b></td>"));
 #ifdef USE_FILE_TIME
         out.printf_P(PSTR("<td><b>Created</b></td><td><b>Modified</b></td>"));
@@ -712,13 +757,16 @@ public:
         for (int i = 0; i < files.Length(); i++)
         {
             DirEntry entry = files[i];
+            // href targets must be percent-encoded (spaces / UTF-8 / reserved
+            // chars); the visible link text and the confirm() prompt stay raw.
+            String enc = UrlEncode(entry.fullName);
 
-            if (entry.isFolder)
-                out.printf_P(PSTR("<tr> <td> <a href=\"/sd/ls?folder=%s/\">%s</a></td><td>%s</td><td>DIR</td>"),
-                             entry.fullName, entry.fullName, FileSize(entry.size).c_str());
+            if (entry.isFolder) // subfolders are listed but not navigable (flat listing)
+                out.printf_P(PSTR("<tr> <td> %s</td><td>%s</td><td>DIR</td>"),
+                             entry.fullName, FileSize(entry.size).c_str());
             else
                 out.printf_P(PSTR("<tr> <td> <a href=\"%s\">%s</a></td><td>%s</td>"),
-                             entry.fullName, entry.fullName, FileSize(entry.size).c_str());
+                             enc.c_str(), entry.fullName, FileSize(entry.size).c_str());
 #ifdef USE_FILE_TIME
             out.printf_P(PSTR("<td><font size=\"-1\">%s</font></td><td><font size=\"-1\">%s</font></td>"),
                          FileTime(entry.creationTime).c_str(), FileTime(entry.writeTime).c_str());
@@ -729,10 +777,10 @@ public:
             {
                 if (sd)
                     out.printf_P(PSTR("<td><a href=\"/sd/tail/%s\">Tail</a>&nbsp<a href=\"/sd/download/%s\">Download</a>&nbsp<a href=\"/sd/del/%s\""),
-                                 entry.fullName, entry.fullName, entry.fullName);
+                                 enc.c_str(), enc.c_str(), enc.c_str());
                 else
                     out.printf_P(PSTR("<td><a href=\"/tail/%s\">Tail</a>&nbsp<a href=\"/download/%s\">Download</a>&nbsp<a href=\"/del/%s\""),
-                                 entry.fullName, entry.fullName, entry.fullName);
+                                 enc.c_str(), enc.c_str(), enc.c_str());
                 out.printf_P(PSTR(" onclick=\"return confirm('Are you sure to delete %s?')\">DEL</a></td></tr>"), entry.fullName);
             }
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
@@ -743,11 +791,6 @@ public:
         FileSystemStats stats = GetFsStats(sd);
         out.printf_P(PSTR("<tr><td>Total:</td><td>%s</td><td></td></tr>\n<tr><td>Free:</td><td>%s</td><td></td></tr>\n</table> <a href=\"/\">Home</a></body>"),
                      FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
-
-#if defined(USE_SD_CARD) && defined (SDFAT)
-        if (sd)
-            out.printf_P(PSTR("<script>function mkdir() { var folder = (getParameterByName('folder')?getParameterByName('folder'):\"/\"); window.location = \"/sd/mkdir?name=\" + folder + document.getElementById('dir').value+\"&folder=\"+folder;}function getParameterByName(name, url = window.location.href) {name = name.replace(/[\\[\\]]/g, '\\\\$&');var regex = new RegExp('[?&]' + name + '(=([^&#]*)|&|#|$)'), results = regex.exec(url); if (!results) return null; if (!results[2]) return ''; return decodeURIComponent(results[2].replace(/\\+/g, ' '));}</script>"));
-#endif
         out.printf_P(PSTR("</html>"));
 
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
@@ -768,13 +811,13 @@ public:
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     void HandleFileUpload(bool sd, AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final)
     {
-
-        if (!index)
+        if (!index) // first chunk: open the destination file
         {
+            _uploadOk = false;
 #ifdef USE_SD_CARD
             if (sd)
             {
-                Logger.Log_P(ILogger::LvlDebug, PSTR("ESPHandleFileUpload SD Name: %s"), filename.c_str());
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Upload start (SD): %s"), filename.c_str());
 #ifdef SDFAT
                 if (request->hasParam("folder"))
                     _fsSdUploadFile = SD.open(request->getParam("folder")->value() + filename, SD_FILE_WRITE);
@@ -790,7 +833,7 @@ public:
             else
 #endif
             {
-                Logger.Log_P(ILogger::LvlDebug, PSTR("ESPHandleFileUpload Name: %s"), filename.c_str());
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Upload start: %s"), filename.c_str());
                 if (filename.startsWith("/"))
                     _fsUploadFile = LIONWIFI_FS.open(filename, "w");
                 else
@@ -808,45 +851,31 @@ public:
             if (_fsUploadFile)
             {
                 size_t w = _fsUploadFile.write(data, len); // Write the received bytes to the file
-                if (w != len) // FS full / write error — abort so the final block reports failure
+                if (w != len) // FS full / write error — abort; reported as failure at final
                 {
-                    Logger.Log_P(ILogger::LvlError, PSTR("ESPHandleFileUpload: short write %u/%u, aborting"), (unsigned)w, (unsigned)len);
+                    Logger.Log_P(ILogger::LvlError, PSTR("Upload: short write %u/%u, aborting"), (unsigned)w, (unsigned)len);
                     _fsUploadFile.close();
                 }
             }
-        if (final)
-        {
+        if (final) // last chunk: close + record outcome. The HTTP response is sent
+        {          // by the route's onRequest handler (an onUpload callback must not).
+            size_t total = index + len;
 #if defined(USE_SD_CARD) && defined(SDFAT)
             if (sd)
             {
+                _uploadOk = (bool)_fsSdUploadFile;
                 if (_fsSdUploadFile)
-                {
                     _fsSdUploadFile.close();
-                    Logger.Log_P(ILogger::LvlDebug, PSTR("ESPHandleFileUpload Size (SDFAT): %ld"), _fsSdUploadFile.size());
-                    String folder;
-                    if (request->hasParam("folder"))
-                        folder = request->getParam("folder")->value();
-
-                    request->redirect(String(F("/sd/ls?folder="))+folder); // Redirect the client to the success page
-                }
-                else
-                    request->send(500, __text_plain__F, F("500: couldn't create file"));
             }
             else
 #endif
             {
-                if (_fsUploadFile) // If the file was successfully created
-                {
-                    _fsUploadFile.close(); // Close the file
-#ifdef USE_SD_CARD
-                    request->redirect(sd ? F("/sd/ls") : F("/spiffs/ls")); // Redirect the client to the success page
-#else
-                    request->redirect(F("/spiffs/ls")); // Redirect the client to the success page
-#endif
-                }
-                else
-                    request->send(500, __text_plain__F, F("500: couldn't create file"));
+                _uploadOk = (bool)_fsUploadFile;
+                if (_fsUploadFile)
+                    _fsUploadFile.close();
             }
+            Logger.Log_P(_uploadOk ? ILogger::LvlInfo : ILogger::LvlError,
+                         PSTR("Upload end: %s, %u bytes (%s)"), filename.c_str(), (unsigned)total, _uploadOk ? PSTR("OK") : PSTR("FAILED"));
         }
     }
 #else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
@@ -859,21 +888,15 @@ public:
         if (upload.status == UPLOAD_FILE_START)
         {
             String filename = upload.filename;
+            if (!filename.startsWith("/")) // both SD (ESP32 VFS) and the internal FS need a leading '/'
+                filename = "/" + filename;
+            Logger.Log_P(ILogger::LvlInfo, PSTR("Upload start: %s"), filename.c_str());
 #ifdef USE_SD_CARD
             if (sd)
-            {
-                Logger.Log_P(ILogger::LvlDebug, PSTR("handleFileUpload Name: %s"), filename.c_str());
                 _fsUploadFile = SD.open(filename, SD_FILE_WRITE);
-            }
             else
 #endif
-            {
-                if (!filename.startsWith("/"))
-                    filename = "/" + filename;
-                Logger.Log_P(ILogger::LvlDebug, PSTR("handleFileUpload Name: %s"), filename.c_str());
                 _fsUploadFile = LIONWIFI_FS.open(filename, "w"); // create if it doesn't exist
-                filename = String();
-            }
         }
         else if (upload.status == UPLOAD_FILE_WRITE)
         {
@@ -892,7 +915,7 @@ public:
             if (_fsUploadFile)
             {                          // If the file was successfully created
                 _fsUploadFile.close(); // Close the file again
-                Logger.Log_P(ILogger::LvlDebug, PSTR("handleFileUpload Size: %d"), upload.totalSize);
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Upload end: %u bytes (OK)"), (unsigned)upload.totalSize);
 #ifdef USE_SD_CARD
                 _server.sendHeader(F("Location"), sd ? F("/sd/ls") : F("/spiffs/ls")); // Redirect the client to the success page
 #else
@@ -908,31 +931,6 @@ public:
     }
 #endif
 
-#if defined(USE_SD_CARD) && defined(SDFAT) && defined(ESP32)
-    void MkDir(AsyncWebServerRequest *request)
-    {
-        DebugDumpRequest(request);
-        AsyncWebParameter *p = request->getParam("name");
-        AsyncWebParameter *p1 = request->getParam("folder");
-        if (!p)
-        {
-            request->send(500, __text_plain__F, F("name missing"));
-            return;
-        }
-        String folder = "/";
-        if (p1)
-            folder = p1->value();
-        auto name = p->value();
-        bool ok = SD.mkdir(name);
-        if (!ok)
-        {
-            request->send(500, __text_plain__F, String(F("Can't create folder ")) + name);
-            return;
-        }
-        request->redirect(String(F("/sd/ls?folder="))+folder);
-    }
-#endif
-
     void AddRoutes()
     {
 #ifdef USE_SD_CARD
@@ -941,14 +939,11 @@ public:
         _server.on("/sd/ls", HTTP_GET,
                    [this](AsyncWebServerRequest *request) { HandleLs(request, true); });
         _server.on(
-            "/sd/ls", HTTP_POST,                                                                                                                                                                        // if the client posts to the upload page
-            [this](AsyncWebServerRequest *request) { request->send(200); },                                                                                                                             // Send status 200 (OK) to tell the client we are ready to receive
+            "/sd/ls", HTTP_POST,
+            // onRequest runs after the upload: turn the recorded outcome into a response.
+            [this](AsyncWebServerRequest *request) { if (_uploadOk) request->redirect(F("/sd/ls")); else request->send(500, __text_plain__F, F("500: upload failed")); },
             [this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) { HandleFileUpload(true, request, filename, index, data, len, final); } // Receive and save the file
         );
-#ifdef SDFAT
-        _server.on("/sd/mkdir", HTTP_GET,
-                   [this](AsyncWebServerRequest *request) { MkDir(request); });
-#endif
 #else
         _server.on("/", [this]() { HandleFileRead("/index.html"); });
         _server.on("/sd/ls", HTTP_GET,
@@ -967,8 +962,9 @@ public:
             request->send(401, __text_plain__F, F("You are logged out"));
         });
         _server.on(
-            "/spiffs/ls", HTTP_POST,                                                                                                                                                                     // if the client posts to the upload page
-            [this](AsyncWebServerRequest *request) { request->send(200); },                                                                                                                              // Send status 200 (OK) to tell the client we are ready to receive
+            "/spiffs/ls", HTTP_POST,
+            // onRequest runs after the upload: turn the recorded outcome into a response.
+            [this](AsyncWebServerRequest *request) { if (_uploadOk) request->redirect(F("/spiffs/ls")); else request->send(500, __text_plain__F, F("500: upload failed")); },
             [this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) { HandleFileUpload(false, request, filename, index, data, len, final); } // Receive and save the file
         );
         _server.serveStatic("/favicon.ico", LIONWIFI_FS, "/favicon.ico");
@@ -989,7 +985,9 @@ public:
             [this]() { HandleFileUpload(false); } // Receive and save the file
         );
         _server.onNotFound([this]() {
-            HandleFileRead(_server.uri());
+            // uri() is percent-encoded on the sync server — decode it so names
+            // with spaces / UTF-8 match the real file (the async path decodes itself).
+            HandleFileRead(_server.urlDecode(_server.uri()));
         });
         _server.on("/", [this]() { HandleFileRead(F("/index_nosd.html")); });
 #endif

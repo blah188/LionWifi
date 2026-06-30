@@ -95,7 +95,8 @@ Override via `build_flags`. The full list lives in the header banner of
 | `QUIET_WIFI_LOGS` | off | Suppress connect/reconnect log lines |
 | `NO_WIFI_TASK` (ESP32) | off | Run `Loop()` from your `loop()` instead of a task |
 | `NO_ASYNC_WEB_SERVER` (ESP32) | off | Use core `WebServer` instead of ESPAsyncWebServer |
-| `USE_SD_CARD` [+ `SDFAT`] | off | Also browse an SD card |
+| `USE_SD_CARD` [+ `SDFAT`] | off | Also browse an SD card (SdFat with `SDFAT`) |
+| `LIONWIFI_NAME_MAX` | 63 | Max listed filename length (bytes); raise for long UTF-8 names |
 
 ## HTTP endpoints
 
@@ -103,7 +104,21 @@ Override via `build_flags`. The full list lives in the header banner of
 `/spiffs/<f>` · `/del<f>` · `/log`, `/log/tail`, `/spiffs/log[/tail]`
 (LionLogger's current-day log) · `/restart` · `/format` (ESP8266 / ESP32-sync) ·
 `/logout` · `/favicon.ico` · `/lion-tasks` (ESP8266). With `USE_SD_CARD`:
-`/sd/ls`, `/sd/tail/<f>`, `/sd/download/<f>`, `/sd/del/<f>`, `/sd/mkdir`.
+`/sd/ls`, `/sd/tail/<f>`, `/sd/download/<f>`, `/sd/del/<f>` (flat — no subfolders).
+
+## SD cards
+
+Enable with `-D USE_SD_CARD` (Arduino SD) or `-D USE_SD_CARD -D SDFAT` (SdFat,
+add `greiman/SdFat`). **You initialize the card yourself** — LionLogger only
+touches the internal filesystem (see the `LionWifiSd` example). With `SDFAT`,
+define the `SdFat SD;` global the library extern-declares, build SdFat in its
+default mode (`FsFile`, FAT+exFAT), and add `-D USE_UTF8_LONG_NAMES=1` so
+non-ASCII filenames aren't shown as `?`.
+
+**`SDFAT` is supported only on the ESP32 async server** (it streams via a chunked
+response; `FsFile` is not an `fs::FS`). On ESP8266 or `-D NO_ASYNC_WEB_SERVER`,
+use the Arduino SD library (`USE_SD_CARD` without `SDFAT`) — the build `#error`s
+otherwise. SD listings are flat (root only — no subfolder navigation).
 
 ## Notes & limitations
 
@@ -113,6 +128,13 @@ Override via `build_flags`. The full list lives in the header banner of
   before sending (no per-row chunking yet); fine for typical filesystems.
 - The `/format` route is omitted on the ESP32 async path (formatting inside an
   async callback trips the task watchdog).
+- **State-changing routes use GET** (`/del…`, `/format`, `/restart`) and there is
+  no CSRF token. Keep HTTP Basic auth enabled (don't set `NO_AUTH`) and/or run the
+  device on a trusted network — treat the web UI as an admin console.
+- `tail` is for text/logs: it serves the last 8 KB as `text/plain`, so a binary
+  file's tail is truncated at the first NUL. Use **Download** for binary files.
+- Listed filenames longer than `LIONWIFI_NAME_MAX` bytes are truncated (and their
+  links then 404); raise the flag for long UTF-8 names.
 
 ## License
 

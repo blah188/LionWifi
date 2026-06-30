@@ -80,10 +80,10 @@ public:
     // Call after WIFI connected
     void Begin()
     {
-        ArduinoOTA.begin();    
-#ifdef ESP32        
-        ArduinoOTA.setTimeout(40000);
-#endif        
+#ifdef ESP32
+        ArduinoOTA.setTimeout(40000); // must be set BEFORE begin() to take effect
+#endif
+        ArduinoOTA.begin();
     }
 
     void Loop()

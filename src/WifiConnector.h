@@ -65,6 +65,8 @@
 //   FsBrowser extras:
 //   USE_SD_CARD [+ SDFAT]    Also browse an SD card (SdFat when SDFAT is set).
 //   USE_FILE_TIME            Show created/modified timestamps in listings.
+//   LIONWIFI_NAME_MAX        Max listed filename length (default 63); raise for
+//                            longer LittleFS/SD names (costs N+1 bytes/entry).
 //
 // ---- HTTP endpoints registered (see FsBrowser::AddRoutes + WifiConnector::Setup):
 //   GET /                         Home page (index.html w/ SD, else index_nosd.html)
@@ -79,7 +81,7 @@
 //   GET /logout                   Clear HTTP Basic auth (401)
 //   GET /favicon.ico              Served from the filesystem
 //   GET /lion-tasks               LionTask debug dump (ESP8266)
-//   GET /sd/ls /sd/tail/<f> /sd/download/<f> /sd/del/<f> /sd/mkdir   (USE_SD_CARD)
+//   GET /sd/ls /sd/tail/<f> /sd/download/<f> /sd/del/<f>            (USE_SD_CARD)
 //
 // Single-instance, non-copyable: owns OS handles (WiFiClient/HTTPClient), the
 // web routes and (on ESP32) a FreeRTOS task. Create one via `new` and assign it

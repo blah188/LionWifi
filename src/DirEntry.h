@@ -10,12 +10,15 @@
 
 struct DirEntry
 {
-    // Max stored name length (excluding NUL). Wider with SDFAT (longer SD paths).
-#ifdef SDFAT
-    const static int MaxSize = 63;
-#else
-    const static int MaxSize = 31;
+    // Max stored name length, excluding the NUL. Longer names are truncated in
+    // listings — and a truncated name then breaks its tail/download/delete links.
+    // LittleFS and FAT/SD allow long names (SPIFFS itself caps at 31), so the
+    // default is generous. Override with -D LIONWIFI_NAME_MAX=N (costs N+1 bytes
+    // per listed entry; SD listings hold up to ~120 entries).
+#ifndef LIONWIFI_NAME_MAX
+#define LIONWIFI_NAME_MAX 63
 #endif
+    const static int MaxSize = LIONWIFI_NAME_MAX;
     DirEntry(const char* name = NULL)
     {
         if (name)

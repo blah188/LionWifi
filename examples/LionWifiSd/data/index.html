@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<!--
+  LionWifi home page for an SD-enabled build. Upload this to the INTERNAL
+  filesystem as /index.html (SPIFFS/LittleFS) — the "/" route serves it when
+  USE_SD_CARD is defined. Links point at both the SD and internal-FS browsers.
+  Keep it small — it lives on flash.
+-->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LionWifi device</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 40rem; }
+    h1 { font-size: 1.3rem; }
+    h2 { font-size: 1rem; margin: 1.2rem 0 .3rem; color: #555; }
+    ul { line-height: 1.9; margin-top: .2rem; }
+    a { text-decoration: none; }
+    .danger { color: #b00; }
+    code { background: #f0f0f0; padding: 0 .3em; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <h1>LionWifi device</h1>
+
+  <h2>Storage</h2>
+  <ul>
+    <li><a href="/spiffs/ls">Internal filesystem</a> (SPIFFS/LittleFS) — browse / upload / download / delete</li>
+    <li><a href="/sd/ls">SD card</a> — browse / upload / download / delete</li>
+  </ul>
+
+  <h2>Device</h2>
+  <ul>
+    <li><a href="/log">Log</a> &middot; <a href="/log/tail">Log (last 8&nbsp;KB)</a></li>
+    <li><a href="/restart" class="danger" onclick="return confirm('Reboot the device?')">Restart</a></li>
+    <li><a href="/logout">Log out</a></li>
+  </ul>
+
+  <p>Edit <code>/index.html</code> on the internal filesystem to customise this page.</p>
+</body>
+</html>

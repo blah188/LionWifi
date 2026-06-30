@@ -1,25 +1,29 @@
-// LionWifi — full example (ESP8266 / ESP32 with the synchronous web server)
+// LionWifi — full example (ESP8266 / ESP32, sync OR async web server)
 //
 // Builds on LionWifiBasic and demonstrates:
 //   * all five event callbacks (connected / disconnected / time-set /
 //     log-clear / ping),
 //   * a custom ping interval + a ping handler that logs heap health,
 //   * a custom "/status" route that renders WifiConnector::StatusHtml() and
-//     streams it with ServerStream (no big String held in RAM),
-//   * reading connector state (Connected/TimeSet/GetMinFreeMemory).
+//     streams it — via ServerStream on the synchronous server, or an
+//     AsyncResponseStream on ESPAsyncWebServer (both are Arduino `Print`s, so
+//     the page body is built once in renderStatus()),
+//   * reading connector state (Connected / TimeSet / GetMinFreeMemory).
 //
-// This example uses the SYNCHRONOUS web server (ServerStream needs it), so on
-// ESP32 build with -D NO_ASYNC_WEB_SERVER. See LionWifiBasic for the async setup.
+// Works on every supported web-server backend:
+//   * ESP8266                          — ESP8266WebServer
+//   * ESP32 default                    — AsyncWebServer (ESPAsyncWebServer + AsyncTCP)
+//   * ESP32 + -D NO_ASYNC_WEB_SERVER   — core WebServer
 //
-// Build flags (see platformio.ini): -D USE_SPIFFS, plus on ESP32
-// -D NO_ASYNC_WEB_SERVER. Override WiFi creds with -D WIFI_SSID / -D WIFI_PASSWORD.
+// Build flags (see platformio.ini): -D USE_SPIFFS or -D LFS. Override WiFi creds
+// with -D WIFI_SSID / -D WIFI_PASSWORD.
 
 #include <Logger.h>
 #include <WifiConnector.h>
-#include <ServerStream.h>
 
-#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-#error "LionWifiFull uses the synchronous web server + ServerStream — build with -D NO_ASYNC_WEB_SERVER on ESP32 (or see LionWifiBasic)."
+// ServerStream is the synchronous-server streaming sink (not used on async).
+#if !defined(ESP32) || defined(NO_ASYNC_WEB_SERVER)
+#include <ServerStream.h>
 #endif
 
 #ifndef WIFI_SSID
@@ -33,12 +37,24 @@
 MyLogger Logger(ILogger::SerialPort | ILogger::Spiffs, ILogger::LvlDebug);
 
 #ifdef ESP32
-WebServer server(80); // synchronous (NO_ASYNC_WEB_SERVER)
+#ifdef NO_ASYNC_WEB_SERVER
+WebServer server(80);
 #else
+AsyncWebServer server(80);
+#endif
+#else // ESP8266
 ESP8266WebServer server(80);
 #endif
 
 WifiConnector *_connector;
+
+// Status page body — written to any Print sink (ServerStream / AsyncResponseStream).
+static void renderStatus(Print &out)
+{
+    out.print(F("<!doctype html><html><body><h3>LionWifi status</h3>"));
+    _connector->StatusHtml(out);
+    out.print(F("<p><a href=\"/spiffs/ls\">files</a> &middot; <a href=\"/log/tail\">log</a></p></body></html>"));
+}
 
 void setup()
 {
@@ -75,23 +91,30 @@ void setup()
     _connector->Setup();
 
     // --- Custom /status route: render StatusHtml() straight to the response ---
-    // ServerStream flushes in ~1 KB chunks, so the page never lives in RAM whole.
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+    // Async: AsyncResponseStream is a Print; the response is sent in one call.
+    server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request)
+    {
+        AsyncResponseStream *response = request->beginResponseStream("text/html");
+        renderStatus(*response);
+        request->send(response);
+    });
+#else
+    // Sync: stream chunks via ServerStream (the page never lives in RAM whole).
     server.on("/status", []()
     {
         server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-        server.send(200, "text/html", "");
+        server.send(200, "text/html", ""); // headers only — NOT send_P("") (see FsBrowser)
         ServerStream out(server);
-        out.print(F("<!doctype html><html><body><h3>LionWifi status</h3>"));
-        _connector->StatusHtml(out);
-        out.print(F("<p><a href=\"/spiffs/ls\">files</a> &middot; <a href=\"/log/tail\">log</a></p>"));
-        out.print(F("</body></html>"));
-        out.flush(); // send the final partial chunk, then terminate the response
+        renderStatus(out);
+        out.flush();                       // emit the final partial chunk, then terminate
 #ifdef ESP32
         server.sendContent("");            // ESP32 WebServer: terminating "0\r\n\r\n" chunk
 #else
         server.chunkedResponseFinalize();  // ESP8266
 #endif
     });
+#endif
 }
 
 void loop()
