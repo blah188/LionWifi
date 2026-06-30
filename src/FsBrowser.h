@@ -1,16 +1,22 @@
 #pragma once
 
-//#define ESP32
-//#define USE_SD
-//#define SDFAT
+// =============================================================================
+// FsBrowser — minimal web filesystem browser for LionWifi (SPIFFS / LittleFS /
+// optional SD). Registers routes on the consumer's web server (ESP8266WebServer,
+// or ESP32 WebServer / ESPAsyncWebServer): directory listing with upload, file
+// tail/download/delete, log views and a format route. HTTP Basic auth optional.
+//
+// Select a filesystem with -D USE_SPIFFS or -D LFS; enable SD with -D USE_SD_CARD
+// (and -D SDFAT for SdFat). Uses the global `Logger` (LionLogger) for the FS
+// semaphore and diagnostics. Header-only except for a few symbols in
+// FsBrowser.cpp (the comparator, the shared PROGMEM MIME strings).
+// =============================================================================
 
 #ifdef ESP32
 #include "soc/rtc_wdt.h"
-//#include <AsyncTCP.h>
 #ifdef NO_ASYNC_WEB_SERVER
 #include <WebServer.h>
 #else
-//#include <ESPAsyncWebSrv.h>
 #include <ESPAsyncWebServer.h>
 #endif
 #else
@@ -19,13 +25,7 @@
 #endif
 
 #ifdef LFS
-#ifdef ESP32
 #include <LittleFS.h>
-//#include <esp_littlefs.h>
-//#define LittleFS LITTLEFS
-#else
-#include <LittleFS.h>
-#endif
 #endif
 #ifdef USE_SPIFFS
 #ifdef ESP32
@@ -68,7 +68,7 @@ struct FileSystemStats
     uint64_t totalSize, freeSize;
 };
 
-int sort(const void *cmp1, const void *cmp2);
+int DirEntrySort(const void *cmp1, const void *cmp2);
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
 void DebugDumpRequest(AsyncWebServerRequest *request);
 #endif
@@ -88,8 +88,8 @@ private:
     ESP8266WebServer &_server;
 #endif
     bool _doAuth = false;
-    const char *_username, *_password;
-    ILogger *_logger;
+    const char *_username = nullptr, *_password = nullptr;
+    ILogger *_logger = nullptr;
 #if defined(USE_SD_CARD) && defined(SDFAT)  
     File32 _fsSdUploadFile;
 #endif
@@ -115,6 +115,11 @@ public:
         }
     }
 
+    // Holds a server reference, an open upload File and registered routes —
+    // single-instance, non-copyable (a copy would alias all of that).
+    FsBrowser(const FsBrowser &) = delete;
+    FsBrowser &operator=(const FsBrowser &) = delete;
+
     static String GetContentType(const String &filename)
     { // convert the file extension to the MIME type
         if (filename.endsWith(".html") || filename.endsWith(".htm"))
@@ -134,7 +139,7 @@ public:
         return __text_plain__F;
     }
 
-    static String fileSize(uint64_t size)
+    static String FileSize(uint64_t size)
     {
         if (size < 100000)
             return String((uint32_t)size);
@@ -143,7 +148,7 @@ public:
         return String((uint32_t)(size / 1024l / 1024l)) + F("m");
     }
 
-    static void fileSize(uint64_t size, Stream &out)
+    static void FileSize(uint64_t size, Stream &out)
     {
         if (size < 100000)
             out.print((uint32_t)size);
@@ -153,23 +158,18 @@ public:
             out.printf_P(PSTR("%ldm"), (uint32_t)(size / 1024l / 1024l));
     }
 
-    static String fileTime(time_t unix)
+    static String FileTime(time_t unix)
     {
 #ifdef USE_FILE_TIME
         static char buffer[64];
         buffer[63] = 0;
-        struct tm *timeinfo;
-        timeinfo = localtime(&unix);
+        struct tm *timeinfo = localtime(&unix);
+        if (!timeinfo)
+            return String(F("Unknown"));
         snprintf_P(buffer, 63, PSTR("%02d/%02d/%04d<br>%02d:%02d:%02d"), timeinfo->tm_mon + 1, timeinfo->tm_mday, timeinfo->tm_year + 1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
         return String(buffer);
-        // static char buffer[64];
-        // buffer[63] = 0;
-        // TimeElements tm;
-        // breakTime(unix, tm);
-        // snprintf_P(buffer, 63, PSTR("%02d/%02d/%04d<br>%02d:%02d:%02d"), tm.Month, tm.Day, tm.Year + 1970, tm.Hour, tm.Minute, tm.Second);
-        // return String(buffer);
 #else
-        return String("Unknown");
+        return String(F("Unknown"));
 #endif
     }
 
@@ -179,7 +179,7 @@ public:
 #ifdef NO_AUTH
         return true; // Authentication disabled at build time — plain access.
 #endif
-        if (_doAuth && !request->authenticate(_username, _password)) // TODO: move to hash?
+        if (_doAuth && !request->authenticate(_username, _password))
         {
             request->requestAuthentication();
             return false;
@@ -192,7 +192,7 @@ public:
 #ifdef NO_AUTH
         return true; // Authentication disabled at build time — plain access.
 #endif
-        if (_doAuth && !_server.authenticate(_username, _password)) // TODO: move to hash?
+        if (_doAuth && !_server.authenticate(_username, _password))
         {
             _server.requestAuthentication();
             if (_logger)
@@ -397,10 +397,6 @@ public:
     }
 #endif
 
-#ifdef ESP32
-#else
-#endif
-
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     bool HandleFileRead(String path, AsyncWebServerRequest *request, bool auth = true) // send the right file to the client (if it exists)
     {
@@ -413,8 +409,6 @@ public:
             return false;
 #endif
 
-        // if (_logger && !path.equalsIgnoreCase(__slash_favicon_ico__F))
-        //     _logger->Log_P(ILogger::LvlDebug, PSTR("handleFileRead: %s"), path.c_str());
         if (path.startsWith("/del"))
         {
             String name = path.substring(4);
@@ -565,7 +559,7 @@ public:
                      PSTR("LFS")
 #endif
 #ifdef USE_SPIFFS
-                         PSTR("SpifFS")
+                         PSTR("SPIFFS")
 #endif
         );
         Logger.UnlockFsSemaphore();
@@ -611,10 +605,11 @@ public:
 #endif
                 files += entry;
 #else
-            //Logger.Log_P(ILogger::LvlDebug, PSTR("Got %s, %ld bytes, %ld time"), file.fullName(), file.size(), file.getLastWrite());
+            // Cap the SD listing at ~120 entries (memory/watchdog guard): once
+            // reached, append a final sentinel row and stop enumerating below.
             if (files.Length() >= 120)
             {
-                DirEntry entry("zzz.zzz"); // TODO: PSTR
+                DirEntry entry("zzz.zzz");
                 entry.size = 0;
                 files += entry;
             }
@@ -697,66 +692,6 @@ public:
         return stats;
     }
 
-#ifdef CONTINGOUS_LS
-    void HandleLs(bool sd)
-    {
-        Logger.Log_P(ILogger::LvlDebug, PSTR("Got LS request(Cont) free mem = %ld"), system_get_free_heap_size());
-        if (!DoAuth())
-            return;
-
-        String buffer;
-        buffer.reserve(512);
-        StringStream lsFile(buffer);
-        _server.setContentLength(CONTENT_LENGTH_UNKNOWN);
-        lsFile.printf_P(PSTR("<html> <body> <form method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"> <input class=\"button\" type=\"submit\" value=\"Upload\"></form>"));
-        lsFile.printf_P(PSTR("<table><tr><td><b>Name</b></td></td><td><b>Size</b></td>"));
-#ifdef USE_FILE_TIME
-        lsFile.printf_P(PSTR("<td><b>Created</b></td><td><b>Modified</b></td>"));
-#endif
-        lsFile.printf_P(PSTR("<td><b>Action</b></td></tr>\n"));
-        _server.send_P(200, __text_html__P, PSTR(""));
-        _server.sendContent(buffer);
-        lsFile.reset();
-
-#ifdef LFS
-        Dir dir = LittleFS.openDir("/");
-#endif
-#ifdef USE_SPIFFS
-        Dir dir = SPIFFS.openDir("/");
-#endif
-        while (dir.next())
-        {
-            lsFile.printf_P(PSTR("<tr> <td> <a href=\"%s\">%s</a></td><td>"),
-                           dir.fileName().c_str()+1, dir.fileName().c_str()+1);
-            fileSize(dir.fileSize(), lsFile);
-            lsFile.printf_P(PSTR("</td>"));
-#ifdef USE_FILE_TIME
-            lsFile.printf_P(PSTR("<td><font size=\"-1\">%s</font></td><td><font size=\"-1\">%s</font></td>"),
-                            fileTime(entry.creationTime).c_str(), fileTime(entry.writeTime).c_str());
-#endif
-            lsFile.printf_P(PSTR("<td><a href=\"/tail/%s\">Tail</a>&nbsp<a href=\"/download/%s\">Download</a>&nbsp<a href=\"/del/%s\""),
-                                    dir.fileName().c_str()+1, dir.fileName().c_str()+1, dir.fileName().c_str()+1);
-            lsFile.printf_P(PSTR(" onclick=\"return confirm('Are you sure to delete %s?')\">DEL</a></td></tr>"), dir.fileName().c_str()+1);
-            _server.sendContent(buffer);
-            lsFile.reset();
-
-        }
-//        Logger.Log_P(ILogger::LvlDebug, PSTR("Getting FS stats"));
-        FileSystemStats stats = GetFsStats(sd);
-//        Logger.Log_P(ILogger::LvlDebug, PSTR("Got FS stats: %lu, %lu"), (unsigned long)stats.totalSize, (unsigned long)stats.fullSize);
-        lsFile.printf_P(PSTR("<tr><td>Total:</td><td>"));
-        fileSize(stats.totalSize, lsFile);
-        lsFile.printf_P(PSTR("</td><td></td></tr>\n<tr><td>Free:</td><td>"));
-        fileSize(stats.freeSize, lsFile);
-        lsFile.printf_P(PSTR("</td><td></td></tr>\n</table> <a href=\"/\">Home</a></body>"));
-        lsFile.printf_P(PSTR("</html>"));
-        _server.sendContent(buffer);
-        _server.chunkedResponseFinalize();
-        lsFile.reset();
-        Logger.Log_P(ILogger::LvlDebug, PSTR("Fully sent LS content, free mem = %ld"), system_get_free_heap_size());
-    }
-
-#else
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     void HandleLs(AsyncWebServerRequest *request, bool sd)
     {
@@ -788,7 +723,7 @@ public:
         else
             ListSpiffsFiles(files);
 
-        qsort(files.GetData(), files.Length(), sizeof(DirEntry), sort);
+        qsort(files.GetData(), files.Length(), sizeof(DirEntry), DirEntrySort);
 
         String buffer;
         StringStream lsFile(buffer);
@@ -807,8 +742,6 @@ public:
         if (sd)
             lsFile.printf_P(PSTR("<form><label for=\"dir\">Create folder:</label><input type=\"text\" id=\"dir\"><input type=\"button\" value=\"Create\" onclick=\"mkdir()\"></form>"));
 #endif
-        // if (folder != "")
-        //     lsFile.printf_P(PSTR("<div> Contents of '%s' </div>"), folder.c_str());
         lsFile.printf_P(PSTR("<table><tr><td><b>Name</b></td></td><td><b>Size</b></td>"));
 #ifdef USE_FILE_TIME
         lsFile.printf_P(PSTR("<td><b>Created</b></td><td><b>Modified</b></td>"));
@@ -820,24 +753,20 @@ public:
         _server.sendContent(buffer);
         lsFile.reset();
 #endif
-        //Serial.println("1");
 
         for (int i = 0; i < files.Length(); i++)
         {
             DirEntry entry = files[i];
-            //String fullPath = (folder + entry.fullName);
-
-//            Logger.Log_P(ILogger::LvlDebug, PSTR("Entry #%d/%d[free mem %ld]: %s"), i+1, files.Length(), system_get_free_heap_size(), entry.fullName);
 
             if (entry.isFolder)
                 lsFile.printf_P(PSTR("<tr> <td> <a href=\"/sd/ls?folder=%s/\">%s</a></td><td>%s</td><td>DIR</td>"),
-                                entry.fullName, entry.fullName, fileSize(entry.size).c_str());
+                                entry.fullName, entry.fullName, FileSize(entry.size).c_str());
             else
                 lsFile.printf_P(PSTR("<tr> <td> <a href=\"%s\">%s</a></td><td>%s</td>"),
-                                entry.fullName, entry.fullName, fileSize(entry.size).c_str());
+                                entry.fullName, entry.fullName, FileSize(entry.size).c_str());
 #ifdef USE_FILE_TIME
             lsFile.printf_P(PSTR("<td><font size=\"-1\">%s</font></td><td><font size=\"-1\">%s</font></td>"),
-                            fileTime(entry.creationTime).c_str(), fileTime(entry.writeTime).c_str());
+                            FileTime(entry.creationTime).c_str(), FileTime(entry.writeTime).c_str());
 #endif
             if (entry.isFolder)
                 lsFile.printf_P(PSTR("<td></td></tr>"));
@@ -856,30 +785,14 @@ public:
 #ifndef ESP32
             _server.sendContent(buffer);
             lsFile.reset();
-#else   
-            rtc_wdt_feed();            
+#else
+            rtc_wdt_feed();
 #endif
-            //Serial.println("2*");
         }
 
-        // if (folder != "")
-        // {
-        //     String parent = folder.substring(0, folder.length() - 1);
-        //     int pos = parent.lastIndexOf('/');
-        //     if (pos >= 0)
-        //         parent = parent.substring(0, pos+1);
-        //     else
-        //         parent = "";
-        //     lsFile.printf_P(PSTR("<tr><td><a href=\"/sd/ls?folder=%s\">[..]</a></td></tr>"), parent.c_str());
-        //     if (parent != "")
-        //         lsFile.printf_P(PSTR("<tr><td><a href=\"/sd/ls\">[root]</a></td></tr>"));
-        // }
-
-//        Logger.Log_P(ILogger::LvlDebug, PSTR("Getting FS stats"));
         FileSystemStats stats = GetFsStats(sd);
-//        Logger.Log_P(ILogger::LvlDebug, PSTR("Got FS stats: %lu, %lu"), (unsigned long)stats.totalSize, (unsigned long)stats.fullSize);
         lsFile.printf_P(PSTR("<tr><td>Total:</td><td>%s</td><td></td></tr>\n<tr><td>Free:</td><td>%s</td><td></td></tr>\n</table> <a href=\"/\">Home</a></body>"),
-                        fileSize(stats.totalSize).c_str(), fileSize(stats.freeSize).c_str());
+                        FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
 
 #if defined(USE_SD_CARD) && defined (SDFAT)
         if (sd)
@@ -888,8 +801,6 @@ public:
         }
 #endif
         lsFile.printf_P(PSTR("</html>"));
-
-        //Serial.println("3");
 
 #ifndef ESP32
         _server.sendContent(buffer);
@@ -905,12 +816,10 @@ public:
         Logger.Log_P(ILogger::LvlDebug, PSTR("Fully sent LS content, free mem = %ld"), esp_get_free_heap_size());
 #endif
     }
-#endif        
 
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     void HandleFileUpload(bool sd, AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final)
     {
-        //DebugDumpRequest(request);
 
         if (!index)
         {
@@ -1094,7 +1003,7 @@ public:
         bool ok = SD.mkdir(name);
         if (!ok)
         {
-            request->send(500, __text_plain__, String(F("Can't create folder ")) + name);
+            request->send(500, __text_plain__F, String(F("Can't create folder ")) + name);
             return;
         }
         request->redirect(String("/sd/ls?folder=")+folder);
@@ -1103,9 +1012,6 @@ public:
 
     void AddRoutes()
     {
-#ifdef ESP32
-#else
-#endif
 #ifdef USE_SD_CARD
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
         _server.on("/", [this](AsyncWebServerRequest *request) { HandleFileRead("/index.html", request); });
@@ -1132,7 +1038,6 @@ public:
 #endif
 #endif
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-        //        _server.on("/", [this](AsyncWebServerRequest * request) { HandleFileRead("/index_nosd.html", request); });
         _server.on("/spiffs/ls", HTTP_GET,
                    [this](AsyncWebServerRequest *request) { HandleLs(request, false); });
         _server.on("/logout", [this](AsyncWebServerRequest *request) {
@@ -1143,19 +1048,11 @@ public:
             [this](AsyncWebServerRequest *request) { request->send(200); },                                                                                                                              // Send status 200 (OK) to tell the client we are ready to receive
             [this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) { HandleFileUpload(false, request, filename, index, data, len, final); } // Receive and save the file
         );
-// #ifdef USE_SD_CARD
-// #ifndef SDFAT
-//         _server.serveStatic("/", SD, "/").setDefaultFile("index.html").setAuthentication(_username, _password);
-//         ;
-// #endif
-// #endif
 #ifdef LFS
         _server.serveStatic("/favicon.ico", LittleFS, "/favicon.ico");
-//        _server.serveStatic("/", LittleFS, "/").setDefaultFile("index_nosd.html").setAuthentication(_username, _password);
 #endif
 #ifdef USE_SPIFFS
         _server.serveStatic("/favicon.ico", SPIFFS, "/favicon.ico");
-//        _server.serveStatic("/", SPIFFS, "/").setDefaultFile("index_nosd.html");
 #endif
         _server.onNotFound([this](AsyncWebServerRequest *request) {
             if (!HandleFileRead(request->url(), request))
@@ -1175,8 +1072,6 @@ public:
         );
         _server.onNotFound([this]() {
             HandleFileRead(_server.uri());
-            // if (!HandleFileRead(_server.uri()))
-            //     _server.send(404, __text_plain__F, F("404: Not Found")); // otherwise, respond with a 404 (Not Found) error
         });
         _server.on("/", [this]() { HandleFileRead(F("/index_nosd.html")); });
 #endif

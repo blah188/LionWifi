@@ -1,4 +1,8 @@
 #pragma once
+
+// DirEntry — one fixed-capacity directory entry used by FsBrowser's listings.
+// Plain POD (no heap members) so it is trivially copyable and safe to sort with
+// qsort / store in a memcpy-growing Array.
 #include <Arduino.h>
 #include <inttypes.h>
 #include <time.h>
@@ -6,7 +10,8 @@
 
 struct DirEntry
 {
-#ifdef SDFAT    
+    // Max stored name length (excluding NUL). Wider with SDFAT (longer SD paths).
+#ifdef SDFAT
     const static int MaxSize = 63;
 #else
     const static int MaxSize = 31;
@@ -32,7 +37,7 @@ struct DirEntry
     const char *Ext()
     {
         if (dotPos < 0)
-            return fullName + MaxSize;
+            return fullName + MaxSize; // points at the guaranteed NUL → empty string
         return fullName + dotPos + 1;
     }
     char fullName[MaxSize+1];

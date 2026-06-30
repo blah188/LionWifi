@@ -38,10 +38,6 @@
 #include <Array.h>
 
 #ifdef ESP32
-#else
-#endif
-
-#ifdef ESP32
 #include <esp32/rom/rtc.h>
 #include <RtosTask.h>
 #include <esp_wifi.h>
@@ -51,9 +47,9 @@
 #include <WebServer.h>
 #else
 #include <ESPAsyncWebServer.h>
-// #include <ESPAsyncWebSrv.h>
 #endif
 
+// FreeRTOS core the WiFi task is pinned to (ESP32 only).
 #ifndef CORE_WIFI
 #define CORE_WIFI 1
 #endif
@@ -106,6 +102,21 @@ extern "C"
 #define WEB_SERVER_AUTH_PASSWORD "admin"
 #endif
 
+// NTP time sync. Override the TZ offset for your region (default +7h, no DST)
+// and/or the NTP server via build flags.
+#ifndef NTP_TZ_OFFSET_SEC
+#define NTP_TZ_OFFSET_SEC (7 * 3600)
+#endif
+#ifndef NTP_SERVER
+#define NTP_SERVER "pool.ntp.org"
+#endif
+
+// Smallest epoch treated as "real NTP time has arrived" (2019-01-01 UTC).
+// Below this, the clock is still the power-on default and time is not set.
+#ifndef MIN_VALID_EPOCH
+#define MIN_VALID_EPOCH 1546300800
+#endif
+
 #ifdef ESP32
 #ifdef NO_ASYNC_WEB_SERVER
 extern WebServer server;
@@ -116,38 +127,8 @@ extern AsyncWebServer server;
 extern ESP8266WebServer server;
 #endif
 
-#ifdef NO_ASYNC_WEB_SERVER
-#else
-#endif
-
 #ifndef WIFI_CLIENT_TIMEOUT
 #define WIFI_CLIENT_TIMEOUT 3000
-#endif
-
-// #ifdef OWN_WIFI_CLIENT
-// class ShortTimeoutWifiClient : public WiFiClient
-// {
-// protected:
-//     ShortTimeoutWifiClient(ClientContext *client) : WiFiClient(client)
-//     {
-//         _timeout = WIFI_CLIENT_TIMEOUT;
-//     }
-
-// public:
-//     ShortTimeoutWifiClient() : WiFiClient()
-//     {
-//         _timeout = WIFI_CLIENT_TIMEOUT;
-//         Logger.Log_P(ILogger::LvlInfo, PSTR("Created WifiClient with %lu timeout"), _timeout);
-//     }
-//     ShortTimeoutWifiClient(const WiFiClient &c) : WiFiClient(c)
-//     {
-//         _timeout = WIFI_CLIENT_TIMEOUT;
-//     }
-// };
-
-// #endif
-
-#ifndef FORBID_WIFI_MONITOR
 #endif
 
 #if defined(ESP32) && !defined(NO_WIFI_TASK)
@@ -188,8 +169,8 @@ public:
     bool TimeSet() { return _timeSet; }
     FsBrowser *Browser() { return _fsBrowser; }
 #ifdef PING_ROUTER
-    int getRouterPingErrorsInRow() { return _routerPingErrorsInRow; }
-    int getRouterPingSuccessesInRow() { return _routerPingSuccessesInRow; }
+    int GetRouterPingErrorsInRow() { return _routerPingErrorsInRow; }
+    int GetRouterPingSuccessesInRow() { return _routerPingSuccessesInRow; }
 #endif
     void TurnOn(bool on = true)
     {
@@ -330,7 +311,7 @@ public:
                      timeinfo->tm_mon + 1, timeinfo->tm_mday, timeinfo->tm_year + 1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
     }
 
-    static const __FlashStringHelper *sdkVersion()
+    static const __FlashStringHelper *SdkVersion()
     {
 #ifdef PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK22x_190703
         return F("2.2.x Jul 3 (default)");
@@ -347,7 +328,7 @@ public:
 #elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK22x_190313)
         return F("v2.2.x Mar 13");
 #elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK305)
-        return F("3.05 (experemental)");
+        return F("3.05 (experimental)");
 #elif defined(ESP32)
         return F("ESP32");
 #else
@@ -394,11 +375,11 @@ public:
         case REASON_DEFAULT_RST:
             return F("Normal");
         case REASON_WDT_RST:
-            return F("Hard Wtd");
+            return F("Hard Wdt");
         case REASON_EXCEPTION_RST:
             return F("Exception");
         case REASON_SOFT_WDT_RST:
-            return F("Soft Wtd");
+            return F("Soft Wdt");
         case REASON_SOFT_RESTART:
             return F("Soft restart");
         case REASON_DEEP_SLEEP_AWAKE:
@@ -412,8 +393,8 @@ public:
 
     void StatusHtml(Print &out)
     {
-#ifndef NO_MEMSTAT_IN_STATUS        
-        // Colect before to minimize memory errors
+#ifndef NO_MEMSTAT_IN_STATUS
+        // Collect before rendering to minimize memory errors
 #ifndef ESP32
         uint32_t freeHeap, maxAlloc;
         uint8_t frag;
@@ -439,7 +420,7 @@ public:
         FormatDateTime(startup, out);
         out.print(F("</b> (uptime <b>"));
         FormatTimespan(now - startup, out);
-        out.printf_P(PSTR("</b>)</span>&nbsp;<span>Built <b>%S %S</b></span>&nbsp;<span>SDK: <b>%S(%S)</b></span></div>"), F(__DATE__), F(__TIME__), sdkVersion(),
+        out.printf_P(PSTR("</b>)</span>&nbsp;<span>Built <b>%S %S</b></span>&nbsp;<span>SDK: <b>%S(%S)</b></span></div>"), F(__DATE__), F(__TIME__), SdkVersion(),
 #ifdef LFS
             F("LFS")
 #elif defined(USE_SPIFFS)
@@ -477,21 +458,12 @@ public:
 #endif
 #endif
 
-// #ifdef OWN_WIFI_CLIENT
-//         _client = new ShortTimeoutWifiClient();
-// #else
-            _client = new WiFiClient();
-            _client->setTimeout(WIFI_CLIENT_TIMEOUT);
-//#endif
+        _client = new WiFiClient();
+        _client->setTimeout(WIFI_CLIENT_TIMEOUT);
         _httpClient = new HTTPClient();
         _httpClient->setTimeout(WIFI_CLIENT_TIMEOUT);
 
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-        // server.on("/lion-tasks",  HTTP_GET, [this](AsyncWebServerRequest *request) {
-        //     if (!_fsBrowser->DoAuth(request)) return;
-        //     auto tasks = LionTask::GetDebugDump();
-        //     request->send(200, "text/plain", tasks);
-        // });
         server.on("/log/tail", HTTP_GET, [this](AsyncWebServerRequest *request)
                   {
             if (!_fsBrowser->DoAuth(request)) return;
@@ -587,7 +559,7 @@ public:
                 _connected = true;
                 _lastConnectedTime = millis();
                 Logger.Log_P(ILogger::LvlInfo, PSTR("Connected to %s; IP address: %s"), _ssids[_curApIdx]->c_str(), WiFi.localIP().toString().c_str());
-                configTime(7 * 3600, 0, "pool.ntp.org");
+                configTime(NTP_TZ_OFFSET_SEC, 0, NTP_SERVER);
 #if defined(ESP32)
                 server.begin();
                 Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP server started"));
@@ -646,7 +618,6 @@ public:
 #ifndef QUIET_WIFI_LOGS
                 Logger.Log_P(ILogger::LvlInfo, PSTR("WiFI disconnected (status = %d), trying to reconnect..."), WiFi.status());
 #endif
-                // ChangeIdx();
                 if (_disconEvent)
                     _disconEvent();
                 Reconnect();
@@ -673,7 +644,7 @@ public:
         {
             time_t now;
             time(&now);
-            if (now > 1546300800)
+            if (now > MIN_VALID_EPOCH)
             {
                 _startupTime = now;
                 randomSeed(now);
@@ -758,10 +729,7 @@ public:
         if (hfree < _minFreeMemory)
         {
             _minFreeMemory = hfree;
-
-            Logger.Log_P(ILogger::LvlInfo, PSTR("====> New free heap = %ld (max %ld, frag %d)"), _minFreeMemory, hmax, hfrag);
-            // system_print_meminfo();
-            // system_show_malloc();
+            Logger.Log_P(ILogger::LvlInfo, PSTR("====> New free heap = %lu (max %lu, frag %d)"), (unsigned long)_minFreeMemory, (unsigned long)hmax, hfrag);
         }
 #else
         uint32_t free = ESP.getFreeHeap();
@@ -770,8 +738,7 @@ public:
         if (free < _minFreeMemory)
         {
             _minFreeMemory = free;
-            //Serial.printf_P( PSTR("====> heap = %ld (max %ld)\n"), _minFreeMemory, maxAlloc);
-            Logger.Log_P(ILogger::LvlInfo, PSTR("====> heap = %ld (max %ld)"), _minFreeMemory, maxAlloc);
+            Logger.Log_P(ILogger::LvlInfo, PSTR("====> heap = %lu (max %lu)"), (unsigned long)_minFreeMemory, (unsigned long)maxAlloc);
         }
         vTaskDelay(1);
 #endif
@@ -789,10 +756,10 @@ protected:
 #ifdef ESP32
         WiFi.mode(WIFI_STA);
         WiFi.setSleep(WIFI_PS_NONE);
-#ifdef DISABLE_11N
+#ifdef DISABLE_11N // force 802.11b/g only (some APs are flaky with 11n on ESP32)
         esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
 #endif
-#ifdef MAX_WIFI_POWER
+#ifdef MAX_WIFI_POWER // crank TX power to the maximum for weak-signal links
         WiFi.setTxPower(WIFI_POWER_19_5dBm);
 #endif
 #else

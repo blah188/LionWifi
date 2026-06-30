@@ -1,5 +1,15 @@
 #pragma once
 
+// =============================================================================
+// MyOta — thin ArduinoOTA wrapper used by LionWifi: wires up start/end/progress/
+// error callbacks (logging through an injected ILogger), unmounts/remounts the
+// filesystem around a filesystem OTA, and logs progress every 25%.
+//
+// Single-instance, non-copyable: the constructor registers ArduinoOTA callbacks
+// that capture `this`, so a copy would leave dangling captures. Call Begin()
+// once WiFi is connected, then Loop() each iteration. LionWifi owns one of these.
+// =============================================================================
+
 #include <ArduinoOTA.h>
 #include <Logger.h>
 
@@ -78,6 +88,10 @@ public:
         });
     }
 
+    // Registers ArduinoOTA callbacks capturing `this`; copying would dangle them.
+    MyOta(const MyOta &) = delete;
+    MyOta &operator=(const MyOta &) = delete;
+
     // Call after WIFI connected
     void Begin()
     {
@@ -92,5 +106,3 @@ public:
         ArduinoOTA.handle();
     }
 };
-
-//extern MyOta *myOta;
