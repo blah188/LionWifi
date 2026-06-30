@@ -1,0 +1,762 @@
+#pragma once
+
+#include <Logger.h>
+#include <Array.h>
+
+#ifdef ESP32
+#else
+#endif
+
+#ifdef ESP32
+#include <esp32/rom/rtc.h>
+#include <RtosTask.h>
+#include <esp_wifi.h>
+#include <HTTPClient.h>
+
+#ifdef NO_ASYNC_WEB_SERVER
+#include <WebServer.h>
+#else
+#include <ESPAsyncWebServer.h>
+// #include <ESPAsyncWebSrv.h>
+#endif
+
+#ifndef CORE_WIFI
+#define CORE_WIFI 1
+#endif
+
+#else // No ESP32
+#include <LionTask.h>
+extern "C"
+{
+#include "user_interface.h"
+}
+#include <ESP8266WiFi.h>
+#include <ESP8266HTTPClient.h>
+#endif
+
+#include <MyOTA.h>
+#include <FsBrowser.h>
+#include <nonstd.h>
+
+#ifndef LOG_CLEAR_EVERY_HOURS
+#define LOG_CLEAR_EVERY_HOURS 4
+#endif
+
+#ifndef LOG_CLEAR_DAYS
+#define LOG_CLEAR_DAYS 14
+#endif
+
+#ifndef WIFI_CONNECT_TIMEOUT
+#define WIFI_CONNECT_TIMEOUT 20000ul
+#endif
+
+#ifndef WIFI_FATAL_CONNECT_TIMEOUT
+#define WIFI_FATAL_CONNECT_TIMEOUT 180000ul
+#endif
+
+#ifndef PING_ROUTER_INTERVAL
+#define PING_ROUTER_INTERVAL 30000ul
+#endif
+
+#ifndef PING_ROUTER_MAX_FAILURES
+#define PING_ROUTER_MAX_FAILURES 4
+#endif
+
+#ifndef WEB_SERVER_AUTH_USER
+#define WEB_SERVER_AUTH_USER "leva"
+#endif
+
+#ifndef WEB_SERVER_AUTH_PASSWORD
+#define WEB_SERVER_AUTH_PASSWORD "blah18"
+#endif
+
+#ifdef ESP32
+#ifdef NO_ASYNC_WEB_SERVER
+extern WebServer server;
+#else
+extern AsyncWebServer server;
+#endif
+#else
+extern ESP8266WebServer server;
+#endif
+
+#ifdef NO_ASYNC_WEB_SERVER
+#else
+#endif
+
+#ifndef WIFI_CLIENT_TIMEOUT
+#define WIFI_CLIENT_TIMEOUT 3000
+#endif
+
+// #ifdef OWN_WIFI_CLIENT
+// class ShortTimeoutWifiClient : public WiFiClient
+// {
+// protected:
+//     ShortTimeoutWifiClient(ClientContext *client) : WiFiClient(client)
+//     {
+//         _timeout = WIFI_CLIENT_TIMEOUT;
+//     }
+
+// public:
+//     ShortTimeoutWifiClient() : WiFiClient()
+//     {
+//         _timeout = WIFI_CLIENT_TIMEOUT;
+//         Logger.Log_P(ILogger::LvlInfo, PSTR("Created WifiClient with %lu timeout"), _timeout);
+//     }
+//     ShortTimeoutWifiClient(const WiFiClient &c) : WiFiClient(c)
+//     {
+//         _timeout = WIFI_CLIENT_TIMEOUT;
+//     }
+// };
+
+// #endif
+
+#ifndef FORBID_WIFI_MONITOR
+#endif
+
+#if defined(ESP32) && !defined(NO_WIFI_TASK)
+class WifiConnector : RtosTask
+#else
+class WifiConnector
+#endif
+{
+private:
+    bool _connected = false, _timeSet = false, _on = true;
+    uint32_t _lastPingTime = 0, _lastLogClearTime = 0, _lastConnectStartTime = 0, _pingEveryMs = 3 * 60 * 1000ul;
+    uint32_t _lastConnectedTime = 0;
+#ifdef FS_LOW_SPACE_THRESHOLD
+    uint32_t _lastFreeSpaceCheck = 0;
+#endif
+    time_t _startupTime = 0;
+#ifdef PING_ROUTER
+    int _routerPingErrorsInRow = 0;
+    int _routerPingSuccessesInRow = 0;
+    uint32_t _lastRouterPingTime = 0;
+#endif
+    MyOta *_myOta;
+    Array<String *> _ssids, _passwords;
+    int _curApIdx = 0;
+    uint32_t _minFreeMemory = 1000000;
+    FsBrowser *_fsBrowser;
+    nonstd::function<void()> _conEvent, _disconEvent, _timeSetEvent, _clearLogEvent, _pingEvent;
+    WiFiClient *_client;
+    HTTPClient *_httpClient;
+
+public:
+    void SetPingTime(uint32_t pt) { _pingEveryMs = pt; }
+    uint32_t GetPingTime() { return _pingEveryMs; }
+    uint32_t GetMinFreeMemory() { return _minFreeMemory; }
+    bool IsOn() { return _on; }
+    bool Connected() { return _connected; }
+    bool TimeSet() { return _timeSet; }
+    FsBrowser *Browser() { return _fsBrowser; }
+#ifdef PING_ROUTER
+    int getRouterPingErrorsInRow() { return _routerPingErrorsInRow; }
+    int getRouterPingSuccessesInRow() { return _routerPingSuccessesInRow; }
+#endif
+    void TurnOn(bool on = true)
+    {
+        if (_on == on)
+            return;
+        if ((_on = on))
+            Connect();
+        else
+            Disconnect();
+    };
+
+    WifiConnector(const char *ssid, const char *pwd, const char *ssid1 = NULL, const char *pwd1 = NULL, const char *ssid2 = NULL, const char *pwd2 = NULL)
+    {
+        _on = true;
+        _ssids += new String(ssid);
+        _passwords += new String(pwd);
+        if (ssid1 && pwd1)
+        {
+            _ssids += new String(ssid1);
+            _passwords += new String(pwd1);
+        }
+        if (ssid2 && pwd2)
+        {
+            _ssids += new String(ssid2);
+            _passwords += new String(pwd2);
+        }
+    }
+
+    void RegisterConnectedEvent(nonstd::function<void()> evt)
+    {
+        _conEvent = evt;
+    }
+    void RegisterDisconnectedEvent(nonstd::function<void()> evt)
+    {
+        _disconEvent = evt;
+    }
+    void RegisterTimeSetEvent(nonstd::function<void()> evt)
+    {
+        _timeSetEvent = evt;
+    }
+    void RegisterClearLogEvent(nonstd::function<void()> evt)
+    {
+        _clearLogEvent = evt;
+    }
+    void RegisterPingEvent(nonstd::function<void()> evt)
+    {
+        _pingEvent = evt;
+    }
+
+    WiFiClient *SharedWifiClient()
+    {
+        return _client;
+    }
+
+    time_t GetStartupTime() { return _startupTime; }
+
+    void StopSharedWifiClient()
+    {
+#ifdef ESP32
+        _client->stop();
+#else
+        _client->abort();
+#endif
+    }
+
+    HTTPClient *SharedHttpClient(const String &url)
+    {
+        return SharedHttpClient(url.c_str());
+    }
+
+    HTTPClient *SharedHttpClient(const char *url = NULL)
+    {
+        if (url)
+            return _httpClient->begin(*_client, url) ? _httpClient : NULL;
+        return _httpClient;
+    }
+
+    static void FormatTimespan(time_t ts, Print &out)
+    {
+        if (ts < 120)
+        {
+            out.print(ts);
+            out.print('s');
+        }
+        else if (ts < 7200)
+        {
+            out.print(ts / 60);
+            out.print('m');
+        }
+        else if (ts < 48 * 3600ul)
+        {
+            out.print(ts / 3600);
+            out.print('h');
+        }
+        else if (ts < 6 * 30 * 24 * 3600ul)
+        {
+            out.print(ts / (24 * 3600ul));
+            out.print('d');
+        }
+        else if (ts < 24 * 30 * 24 * 3600ul)
+        {
+            out.print(ts / (30 * 24 * 3600ul));
+            out.print(F(" months"));
+        }
+        else
+        {
+            out.print(ts / (365 * 24 * 3600ul));
+            out.print(F(" years"));
+        }
+    }
+
+    static void FormatTime(time_t ts, Print &out)
+    {
+        struct tm *timeinfo = localtime(&ts);
+        out.printf_P(PSTR("%02d:%02d:%02d"),
+                     timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+    }
+
+    static void FormatDateTime(time_t ts, Print &out)
+    {
+        struct tm *timeinfo = localtime(&ts);
+        out.printf_P(PSTR("%02d/%02d/%04d %02d:%02d:%02d"),
+                     timeinfo->tm_mon + 1, timeinfo->tm_mday, timeinfo->tm_year + 1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+    }
+
+    static const __FlashStringHelper *sdkVersion()
+    {
+#ifdef PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK22x_190703
+        return F("2.2.x Jul 3 (default)");
+#elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK221)
+        return F("2.21");
+#elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK3)
+        return F("pre-3.0");
+#elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK22x_191122)
+        return F("v2.2.x Nov 22");
+#elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK22x_191105)
+        return F("v2.2.x Nov 5");
+#elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK22x_191024)
+        return F("v2.2.x Oct 24");
+#elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK22x_190313)
+        return F("v2.2.x Mar 13");
+#elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK305)
+        return F("3.05 (experemental)");
+#elif defined(ESP32)
+        return F("ESP32");
+#else
+        return F("Unknown");
+#endif
+    }
+
+    static const __FlashStringHelper *ResetReason(uint32_t reason)
+    {
+        switch (reason)
+        {
+#ifdef ESP32
+        case 1:
+            return F("POWERON_RESET"); /**<1, Vbat power on reset*/
+        case 3:
+            return F("SW_RESET"); /**<3, Software reset digital core*/
+        case 4:
+            return F("OWDT_RESET"); /**<4, Legacy watch dog reset digital core*/
+        case 5:
+            return F("DEEPSLEEP_RESET"); /**<5, Deep Sleep reset digital core*/
+        case 6:
+            return F("SDIO_RESET"); /**<6, Reset by SLC module, reset digital core*/
+        case 7:
+            return F("TG0WDT_SYS_RESET"); /**<7, Timer Group0 Watch dog reset digital core*/
+        case 8:
+            return F("TG1WDT_SYS_RESET"); /**<8, Timer Group1 Watch dog reset digital core*/
+        case 9:
+            return F("RTCWDT_SYS_RESET"); /**<9, RTC Watch dog Reset digital core*/
+        case 10:
+            return F("INTRUSION_RESET"); /**<10, Instrusion tested to reset CPU*/
+        case 11:
+            return F("TGWDT_CPU_RESET"); /**<11, Time Group reset CPU*/
+        case 12:
+            return F("SW_CPU_RESET"); /**<12, Software reset CPU*/
+        case 13:
+            return F("RTCWDT_CPU_RESET"); /**<13, RTC Watch dog Reset CPU*/
+        case 14:
+            return F("EXT_CPU_RESET"); /**<14, for APP CPU, reseted by PRO CPU*/
+        case 15:
+            return F("RTCWDT_BROWN_OUT_RESET"); /**<15, Reset when the vdd voltage is not stable*/
+        case 16:
+            return F("RTCWDT_RTC_RESET"); /**<16, RTC Watch dog reset digital core and rtc module*/
+#else
+        case REASON_DEFAULT_RST:
+            return F("Normal");
+        case REASON_WDT_RST:
+            return F("Hard Wtd");
+        case REASON_EXCEPTION_RST:
+            return F("Exception");
+        case REASON_SOFT_WDT_RST:
+            return F("Soft Wtd");
+        case REASON_SOFT_RESTART:
+            return F("Soft restart");
+        case REASON_DEEP_SLEEP_AWAKE:
+            return F("Deep awake");
+        case REASON_EXT_SYS_RST:
+            return F("Ext sys");
+#endif
+        }
+        return F("Unknown");
+    }
+
+    void StatusHtml(Print &out)
+    {
+#ifndef NO_MEMSTAT_IN_STATUS        
+        // Colect before to minimize memory errors
+#ifndef ESP32
+        uint32_t freeHeap, maxAlloc;
+        uint8_t frag;
+        ESP.getHeapStats(&freeHeap, &maxAlloc, &frag);
+        uint32_t freeStack = ESP.getFreeContStack();
+#else
+        uint32_t freeHeap = ESP.getFreeHeap();
+        uint32_t maxAlloc = ESP.getMaxAllocHeap();
+        uint8_t frag = freeHeap > 0 ? (uint8_t)(100 - (uint8_t)((uint32_t)maxAlloc * 100 / freeHeap)) : 0;
+#endif
+#endif
+
+        time_t now = time(NULL);
+        time_t startup = GetStartupTime();
+        out.print(F("<div class='global-status'><span>Now <b>"));
+        FormatTime(now, out);
+        out.print(F("</b></span>&nbsp;<span>Restarted <b>"));
+        FormatDateTime(startup, out);
+        out.print(F("</b> (uptime <b>"));
+        FormatTimespan(now - startup, out);
+        out.printf_P(PSTR("</b>)</span>&nbsp;<span>Built <b>%S %S</b></span>&nbsp;<span>SDK: <b>%S(%S)</b></span></div>"), F(__DATE__), F(__TIME__), sdkVersion(),
+#ifdef LFS
+            F("LFS")
+#elif defined(USE_SPIFFS)
+            F("SPIFFS")
+#else
+            F("???")
+#endif
+    );
+
+#ifndef NO_MEMSTAT_IN_STATUS        
+        // Memory stats
+        out.print(F("<div class='memory-status'>"));
+#ifndef ESP32
+        out.printf_P(PSTR("Heap: <b>%u</b>B (loop min <b>%u</b>) | Frag: <b>%d%%</b> | Stack: <b>%u</b>B"),
+                      freeHeap, _minFreeMemory, frag, freeStack);
+#else
+        out.printf_P(PSTR("Heap: <b>%u</b>B (min <b>%u</b>) | Frag: <b>%d%%</b>"),
+                      freeHeap, _minFreeMemory, frag);
+#endif
+        out.print(F("</div><br>"));
+#endif
+    }
+
+    void Setup()
+    {
+        _myOta = new MyOta(&Logger);
+
+#if defined(ESP32) && !defined(NO_WIFI_TASK)
+        RtosTask::Setup("WiFi", CORE_WIFI);
+#else
+#ifndef ESP32
+            server.begin();
+            Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP server started"));
+            ESP.wdtEnable(5000);
+#endif
+#endif
+
+// #ifdef OWN_WIFI_CLIENT
+//         _client = new ShortTimeoutWifiClient();
+// #else
+            _client = new WiFiClient();
+            _client->setTimeout(WIFI_CLIENT_TIMEOUT);
+//#endif
+        _httpClient = new HTTPClient();
+        _httpClient->setTimeout(WIFI_CLIENT_TIMEOUT);
+
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+        // server.on("/lion-tasks",  HTTP_GET, [this](AsyncWebServerRequest *request) {
+        //     if (!_fsBrowser->DoAuth(request)) return;
+        //     auto tasks = LionTask::GetDebugDump();
+        //     request->send(200, "text/plain", tasks);
+        // });
+        server.on("/log/tail", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            _fsBrowser->SendFileResponse(Logger.GetLogFileName(true), request, false, true); });
+        server.on("/spiffs/log/tail", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            _fsBrowser->SendFileResponse(Logger.GetLogFileName(true), request, false, true); });
+        server.on("/log", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            _fsBrowser->SendFileResponse(Logger.GetLogFileName(true), request, false, false); });
+        server.on("/spiffs/log", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            _fsBrowser->SendFileResponse(Logger.GetLogFileName(true), request, false, false); });
+
+        server.on("/restart", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            request->send(200, "text/plain", "Restarting...");
+            delay(100);
+            ESP.restart(); });
+#else
+#if !defined(ESP32)
+            server.on(F("/lion-tasks"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            auto tasks = LionTask::GetDebugDump();
+            server.send(200, __text_plain__F, tasks); });
+#endif
+            server.on(F("/log"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            _fsBrowser->SendFileResponse(Logger.GetLogFileName(true), false, false); });
+            server.on(F("/spiffs/log"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            _fsBrowser->SendFileResponse(Logger.GetLogFileName(true), false, false); });
+            server.on(F("/log/tail"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            _fsBrowser->SendFileResponse(Logger.GetLogFileName(true), false, true); });
+            server.on(F("/spiffs/log/tail"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            _fsBrowser->SendFileResponse(Logger.GetLogFileName(true), false, true); });
+
+            server.on(F("/restart"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            server.send(200, __text_plain__F, F("Restarting..."));
+            delay(100);
+            ESP.restart(); });
+#endif
+
+        _fsBrowser = new FsBrowser(&Logger, server, WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
+        _fsBrowser->AddRoutes();
+
+#if !defined(ESP32) || defined(NO_WIFI_TASK)
+        if (_on)
+            Connect();
+#endif
+    }
+
+#if defined(ESP32) && !defined(NO_WIFI_TASK)
+    virtual void TaskBody()
+    {
+        if (_on)
+            Connect();
+        while (true)
+        {
+            Loop();
+            vTaskDelay(1 / portTICK_PERIOD_MS);
+        }
+    }
+#endif
+
+    void Loop()
+    {
+        if (!_on)
+        {
+#ifndef ESP32
+            ESP.wdtFeed();
+            return;
+#endif
+        }
+
+        if (WiFi.status() == WL_CONNECTED)
+        {
+            if (!_connected)
+            {
+                _connected = true;
+                _lastConnectedTime = millis();
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Connected to %s; IP address: %s"), _ssids[_curApIdx]->c_str(), WiFi.localIP().toString().c_str());
+                configTime(7 * 3600, 0, "pool.ntp.org");
+#if defined(ESP32)
+                server.begin();
+                Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP server started"));
+#endif
+                _myOta->Begin();
+                if (_conEvent)
+                    _conEvent();
+            }
+            _myOta->Loop();
+#if defined(NO_ASYNC_WEB_SERVER) || !defined(ESP32)
+            server.handleClient();
+#endif
+#ifdef PING_ROUTER
+            if (millis() - _lastRouterPingTime > PING_ROUTER_INTERVAL)
+            {
+                // Serial.printf_P(PSTR("Pinging router: "));
+                _lastRouterPingTime = millis();
+                if (SharedWifiClient()->connect(PING_ROUTER, 80))
+                {
+                    _routerPingErrorsInRow = 0;
+                    ++_routerPingSuccessesInRow;
+                    // Logger.Log_P(ILogger::LvlDebug, PSTR("All OK in Baghdad"));
+                }
+                else
+                {
+                    _routerPingSuccessesInRow = 0;
+                    Logger.Log_P(ILogger::LvlWarning, PSTR("Router ping failed in %lums"), millis() - _lastRouterPingTime);
+                    if (++_routerPingErrorsInRow > PING_ROUTER_MAX_FAILURES)
+                    {
+                        Logger.Log_P(ILogger::LvlInfo, PSTR("!!! Rebooting devce as router ping failed %d times"), _routerPingErrorsInRow);
+                        delay(300);
+                        ESP.restart();
+                    }
+                }
+                StopSharedWifiClient();
+            }
+#endif
+        }
+        else
+        {
+            if (_connected)
+            {
+                _connected = false;
+                _lastConnectedTime = millis();
+#ifndef QUIET_WIFI_LOGS
+                Logger.Log_P(ILogger::LvlInfo, PSTR("WiFI disconnected (status = %d), trying to reconnect..."), WiFi.status());
+#endif
+                // ChangeIdx();
+                if (_disconEvent)
+                    _disconEvent();
+                Reconnect();
+            }
+#ifndef FORBID_WIFI_MONITOR
+            else if (millis() - _lastConnectedTime > WIFI_FATAL_CONNECT_TIMEOUT)
+            {
+                Logger.Log_P(ILogger::LvlInfo, PSTR("!!! Rebooting devce as disconnected for %lus"), millis() - _lastConnectedTime);
+                delay(300);
+                ESP.restart();
+            }
+#endif
+            else if (millis() - _lastConnectStartTime > WIFI_CONNECT_TIMEOUT)
+            {
+                ChangeIdx();
+#ifndef QUIET_WIFI_LOGS
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Changing AP to %s after %lus"), _ssids[_curApIdx]->c_str(), WIFI_CONNECT_TIMEOUT / 1000ul);
+#endif
+                Reconnect();
+            }
+        }
+
+        if (!_timeSet)
+        {
+            time_t now;
+            time(&now);
+            if (now > 1546300800)
+            {
+                _startupTime = now;
+                randomSeed(now);
+                _timeSet = true;
+                struct tm *timeinfo = localtime(&now);
+                Logger.Log_P(ILogger::LvlInfo, PSTR("+++Restarted %02d/%02d/%04d %02d:%02d:%02d+++, buit %S %S"),
+                             timeinfo->tm_mon + 1, timeinfo->tm_mday, timeinfo->tm_year + 1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, F(__DATE__), F(__TIME__));
+
+#ifdef ESP32
+                RESET_REASON reason = rtc_get_reset_reason(0);
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Restart reason %S"),
+                             ResetReason(reason));
+#else
+                struct rst_info *rtc_info = system_get_rst_info();
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Restart reason %S, exception %d, epc1=0x%08x, epc2=0x%08x, epc3=0x%08x, excvaddr=0x%08x, depc=0x%08x"),
+                             ResetReason(rtc_info->reason), rtc_info->exccause, rtc_info->epc1, rtc_info->epc2, rtc_info->epc3, rtc_info->excvaddr, rtc_info->depc);
+#endif                             
+
+                if (_timeSetEvent)
+                    _timeSetEvent();
+            }
+        }
+#ifdef FS_LOW_SPACE_THRESHOLD
+        // Wide-level free-space watchdog: updates Logger's low-space flag (read by the
+        // status LED) and, if FS_LOW_SPACE_AUTOCLEAN is enabled, trims oldest logs.
+        // Runs in all modes (a near-full FS silently fails small writes even offline).
+#ifndef FS_SPACE_CHECK_INTERVAL_MS
+#define FS_SPACE_CHECK_INTERVAL_MS 60000ul
+#endif
+        if (!_lastFreeSpaceCheck || millis() - _lastFreeSpaceCheck > FS_SPACE_CHECK_INTERVAL_MS)
+        {
+            _lastFreeSpaceCheck = millis();
+            Logger.EnsureFreeSpace(FS_LOW_SPACE_THRESHOLD, FS_LOW_SPACE_TARGET);
+        }
+#endif
+        // Periodic log maintenance. The dateless-log size cap runs in ALL modes
+        // (those logs accumulate even without NTP time, e.g. offline/guest); the
+        // date-based clearing needs a valid date, so it only runs once time is set.
+        if (!_lastLogClearTime || millis() - _lastLogClearTime > LOG_CLEAR_EVERY_HOURS * 3600l * 1000l) // Startup or time passed
+        {
+            _lastLogClearTime = millis();
+#ifdef LOG_CLEARING_ENABLED
+#ifdef MAX_LOG_BYTES
+            Logger.CapDatelessLogIfNeeded(MAX_LOG_BYTES);
+#endif
+            if (_timeSet)
+            {
+                Logger.ClearOldLogs(LOG_CLEAR_DAYS, false, true);
+#ifdef LOG_CLEAR_FREE_SPACE
+                Logger.ClearOldestLogIfNeeded(LOG_CLEAR_FREE_SPACE);
+#endif
+                if (_clearLogEvent)
+                    _clearLogEvent();
+            }
+#endif // LOG_CLEARING_ENABLED
+        }
+
+        if (millis() - _lastPingTime >= _pingEveryMs) // ping time...
+        {
+            if (_pingEvent)
+                _pingEvent();
+            else
+            {
+#ifdef PING_ROUTER
+                Logger.Log_P(ILogger::LvlDebug, PSTR("Ping [%ldms] %d/%d ok/bad"), millis() - _lastPingTime, _routerPingSuccessesInRow, _routerPingErrorsInRow);
+#else
+                Logger.Log_P(ILogger::LvlDebug, PSTR("Ping [%ldms]"), millis() - _lastPingTime);
+#endif
+            }
+
+            _lastPingTime = millis();
+        }
+
+#ifndef ESP32
+        ESP.wdtFeed();
+
+        uint32_t hfree;
+        uint32_t hmax;
+        uint8_t hfrag;
+        ESP.getHeapStats(&hfree, &hmax, &hfrag);
+        if (hfree < _minFreeMemory)
+        {
+            _minFreeMemory = hfree;
+
+            Logger.Log_P(ILogger::LvlInfo, PSTR("====> New free heap = %ld (max %ld, frag %d)"), _minFreeMemory, hmax, hfrag);
+            // system_print_meminfo();
+            // system_show_malloc();
+        }
+#else
+        uint32_t free = ESP.getFreeHeap();
+        uint32_t maxAlloc = ESP.getMaxAllocHeap();
+
+        if (free < _minFreeMemory)
+        {
+            _minFreeMemory = free;
+            //Serial.printf_P( PSTR("====> heap = %ld (max %ld)\n"), _minFreeMemory, maxAlloc);
+            Logger.Log_P(ILogger::LvlInfo, PSTR("====> heap = %ld (max %ld)"), _minFreeMemory, maxAlloc);
+        }
+        vTaskDelay(1);
+#endif
+    }
+
+protected:
+    void ChangeIdx()
+    {
+        if (++_curApIdx >= _ssids.Length())
+            _curApIdx = 0;
+    }
+    void Connect()
+    {
+        _lastConnectStartTime = millis();
+#ifdef ESP32
+        WiFi.mode(WIFI_STA);
+        WiFi.setSleep(WIFI_PS_NONE);
+#ifdef DISABLE_11N
+        esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
+#endif
+#ifdef MAX_WIFI_POWER
+        WiFi.setTxPower(WIFI_POWER_19_5dBm);
+#endif
+#else
+            WiFi.mode(WIFI_STA);
+            WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+        WiFi.persistent(false);
+        WiFi.disconnect(true);
+#ifndef QUIET_WIFI_LOGS
+        Logger.Log_P(ILogger::LvlInfo, PSTR("Connecting to %s/%s"), _ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
+#endif
+        WiFi.begin(_ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
+    }
+    void Reconnect()
+    {
+        _lastConnectStartTime = millis();
+#ifndef QUIET_WIFI_LOGS
+        Logger.Log_P(ILogger::LvlInfo, PSTR("Reconnecting to %s/%s"), _ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
+#endif
+        WiFi.begin(_ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
+    }
+    void Disconnect()
+    {
+        WiFi.mode(WIFI_STA);
+#ifdef ESP32
+        WiFi.setSleep(WIFI_PS_NONE);
+#else
+            WiFi.setSleepMode(WIFI_NONE_SLEEP);
+#endif
+        WiFi.persistent(false);
+        WiFi.disconnect(true);
+        Logger.Log_P(ILogger::LvlInfo, PSTR("Force disconnected"));
+    }
+};
+
+extern WifiConnector *_connector;
