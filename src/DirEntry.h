@@ -36,10 +36,10 @@ struct DirEntry
         return fullName + dotPos + 1;
     }
     char fullName[MaxSize+1];
-    size_t size;
+    size_t size = 0;
 #ifdef USE_FILE_TIME
-    time_t creationTime, writeTime;
-#endif    
-    int dotPos;
+    time_t creationTime = 0, writeTime = 0;
+#endif
+    int dotPos = -1;
     bool isFolder = false;
 };

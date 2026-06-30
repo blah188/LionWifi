@@ -125,7 +125,7 @@ public:
             return F("application/javascript");
         else if (filename.endsWith(".ico"))
             return F("image/x-icon");
-        else if (filename.endsWith(".ico"))
+        else if (filename.endsWith(".png"))
             return F("image/png");
         else if (filename.endsWith(".jpg"))
             return F("image/jpeg");
@@ -272,11 +272,12 @@ public:
             size_t read = sdDataFile.readBytes(buf, TailSize);
             sdDataFile.close();
 #else
-            if (dataFile.size() > TailSize)
-                dataFile.seek(dataFile.size() - TailSize);
+            uint32_t tailPos = dataFile.size() > TailSize ? dataFile.size() - TailSize : 0;
+            if (tailPos)
+                dataFile.seek(tailPos);
             size_t read = dataFile.readBytes(buf, TailSize);
             if (_logger)
-                _logger->Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: sending %d tail bytes (from pos %d) of file %s"), read, dataFile.size() - TailSize, name);
+                _logger->Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: sending %u tail bytes (from pos %lu) of file %s"), (unsigned)read, (unsigned long)tailPos, name);
             dataFile.close();
 #endif
             buf[read] = 0;
@@ -934,7 +935,14 @@ public:
         else
 #endif
             if (_fsUploadFile)
-                _fsUploadFile.write(data, len); // Write the received bytes to the file
+            {
+                size_t w = _fsUploadFile.write(data, len); // Write the received bytes to the file
+                if (w != len) // FS full / write error — abort so the final block reports failure
+                {
+                    Logger.Log_P(ILogger::LvlError, PSTR("ESPHandleFileUpload: short write %u/%u, aborting"), (unsigned)w, (unsigned)len);
+                    _fsUploadFile.close();
+                }
+            }
         if (final)
         {
 #if defined(USE_SD_CARD) && defined(SDFAT)
@@ -1014,7 +1022,14 @@ public:
         else if (upload.status == UPLOAD_FILE_WRITE)
         {
             if (_fsUploadFile)
-                _fsUploadFile.write(upload.buf, upload.currentSize); // Write the received bytes to the file
+            {
+                size_t w = _fsUploadFile.write(upload.buf, upload.currentSize); // Write the received bytes to the file
+                if (w != upload.currentSize) // FS full / write error — abort so UPLOAD_FILE_END reports failure
+                {
+                    Logger.Log_P(ILogger::LvlError, PSTR("handleFileUpload: short write %u/%u, aborting"), (unsigned)w, (unsigned)upload.currentSize);
+                    _fsUploadFile.close();
+                }
+            }
         }
         else if (upload.status == UPLOAD_FILE_END)
         {

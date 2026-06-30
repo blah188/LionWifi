@@ -169,14 +169,15 @@ private:
     int _routerPingSuccessesInRow = 0;
     uint32_t _lastRouterPingTime = 0;
 #endif
-    MyOta *_myOta;
+    MyOta *_myOta = nullptr;
     Array<String *> _ssids, _passwords;
     int _curApIdx = 0;
-    uint32_t _minFreeMemory = 1000000;
-    FsBrowser *_fsBrowser;
+    uint32_t _minFreeMemory = 1000000; // seed high so the first heap sample always wins
+    FsBrowser *_fsBrowser = nullptr;
     std::function<void()> _conEvent, _disconEvent, _timeSetEvent, _clearLogEvent, _pingEvent;
-    WiFiClient *_client;
-    HTTPClient *_httpClient;
+    WiFiClient *_client = nullptr;
+    HTTPClient *_httpClient = nullptr;
+    bool _otaStarted = false;
 
 public:
     void SetPingTime(uint32_t pt) { _pingEveryMs = pt; }
@@ -309,6 +310,8 @@ public:
     static void FormatTime(time_t ts, Print &out)
     {
         struct tm *timeinfo = localtime(&ts);
+        if (!timeinfo) // localtime() can return NULL for an out-of-range ts
+            return;
         out.printf_P(PSTR("%02d:%02d:%02d"),
                      timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
     }
@@ -316,6 +319,8 @@ public:
     static void FormatDateTime(time_t ts, Print &out)
     {
         struct tm *timeinfo = localtime(&ts);
+        if (!timeinfo) // localtime() can return NULL for an out-of-range ts
+            return;
         out.printf_P(PSTR("%02d/%02d/%04d %02d:%02d:%02d"),
                      timeinfo->tm_mon + 1, timeinfo->tm_mday, timeinfo->tm_year + 1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
     }
@@ -653,8 +658,9 @@ public:
                 randomSeed(now);
                 _timeSet = true;
                 struct tm *timeinfo = localtime(&now);
-                Logger.Log_P(ILogger::LvlInfo, PSTR("+++Restarted %02d/%02d/%04d %02d:%02d:%02d+++, buit %S %S"),
-                             timeinfo->tm_mon + 1, timeinfo->tm_mday, timeinfo->tm_year + 1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, F(__DATE__), F(__TIME__));
+                if (timeinfo)
+                    Logger.Log_P(ILogger::LvlInfo, PSTR("+++Restarted %02d/%02d/%04d %02d:%02d:%02d+++, built %S %S"),
+                                 timeinfo->tm_mon + 1, timeinfo->tm_mday, timeinfo->tm_year + 1900, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, F(__DATE__), F(__TIME__));
 
 #ifdef ESP32
                 RESET_REASON reason = rtc_get_reset_reason(0);
@@ -686,7 +692,7 @@ public:
         // Periodic log maintenance. The dateless-log size cap runs in ALL modes
         // (those logs accumulate even without NTP time, e.g. offline/guest); the
         // date-based clearing needs a valid date, so it only runs once time is set.
-        if (!_lastLogClearTime || millis() - _lastLogClearTime > LOG_CLEAR_EVERY_HOURS * 3600l * 1000l) // Startup or time passed
+        if (!_lastLogClearTime || millis() - _lastLogClearTime > (uint32_t)LOG_CLEAR_EVERY_HOURS * 3600UL * 1000UL) // Startup or time passed
         {
             _lastLogClearTime = millis();
 #ifdef LOG_CLEARING_ENABLED
@@ -712,9 +718,9 @@ public:
             else
             {
 #ifdef PING_ROUTER
-                Logger.Log_P(ILogger::LvlDebug, PSTR("Ping [%ldms] %d/%d ok/bad"), millis() - _lastPingTime, _routerPingSuccessesInRow, _routerPingErrorsInRow);
+                Logger.Log_P(ILogger::LvlDebug, PSTR("Ping [%lums] %d/%d ok/bad"), millis() - _lastPingTime, _routerPingSuccessesInRow, _routerPingErrorsInRow);
 #else
-                Logger.Log_P(ILogger::LvlDebug, PSTR("Ping [%ldms]"), millis() - _lastPingTime);
+                Logger.Log_P(ILogger::LvlDebug, PSTR("Ping [%lums]"), millis() - _lastPingTime);
 #endif
             }
 

@@ -6,9 +6,9 @@
 class MyOta
 {
 private:
-    ILogger *_logger;
-    int otaPercent;
-    bool _sketchUpload;
+    ILogger *_logger = nullptr;
+    int _otaPercent = -1;
+    bool _sketchUpload = false;
 
 public:
     MyOta(ILogger *logger)
@@ -30,7 +30,7 @@ public:
                 SPIFFS.end();
 #endif                
             }
-            otaPercent = 0;
+            _otaPercent = 0;
         });
         ArduinoOTA.onEnd([this]() 
         {
@@ -48,12 +48,14 @@ public:
         });
         ArduinoOTA.onProgress([this](unsigned int progress, unsigned int total) 
         {
-            if (_logger)
+            if (_logger && total)
             {
-                int p = progress / (total / 100);
-                if (p%25 == 0 && p != otaPercent)
+                // Integer-safe percent: avoids divide-by-zero when total < 100
+                // (small images / an early callback before the size is known).
+                int p = (int)((uint64_t)progress * 100 / total);
+                if (p % 25 == 0 && p != _otaPercent)
                 {
-                    otaPercent = p;
+                    _otaPercent = p;
                     _logger->Log_P(ILogger::LvlDebug, PSTR("OTA: %d%%"), p);
                 }
             }
