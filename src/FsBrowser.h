@@ -956,6 +956,13 @@ public:
 #endif
 #endif
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+#ifndef USE_SD_CARD
+        // SPIFFS/LittleFS-only build: serve the no-SD landing page at root.
+        // (With USE_SD_CARD the root is registered above → /index.html.) Without
+        // this, the ESP32-async build leaves "/" unhandled → onNotFound →
+        // HandleFileRead("/") appends index.html → 404. Mirrors the sync branch.
+        _server.on("/", [this](AsyncWebServerRequest *request) { HandleFileRead("/index_nosd.html", request); });
+#endif
         _server.on("/spiffs/ls", HTTP_GET,
                    [this](AsyncWebServerRequest *request) { HandleLs(request, false); });
         _server.on("/logout", [this](AsyncWebServerRequest *request) {

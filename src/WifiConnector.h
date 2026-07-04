@@ -53,6 +53,8 @@
 //   MAX_LOG_BYTES, LOG_CLEAR_FREE_SPACE, FS_LOW_SPACE_THRESHOLD/TARGET,
 //   FS_SPACE_CHECK_INTERVAL_MS                Free-space / size watchdog tuning.
 //   NO_MEMSTAT_IN_STATUS     Drop heap/frag stats from the status page.
+//   NO_WIFI_STAT_IN_STATUS   Drop the WiFi RSSI/quality/channel line from the
+//                            status page (shown by default).
 //   LOG_FAVICON              Also log favicon.ico requests.
 //
 //   ESP32-specific:
@@ -214,6 +216,10 @@ private:
     uint32_t _minFreeMemory = 1000000; // seed high so the first heap sample always wins
     FsBrowser *_fsBrowser = nullptr;
     std::function<void()> _conEvent, _disconEvent, _timeSetEvent, _clearLogEvent, _pingEvent;
+    // OTA hooks — forwarded to _myOta (which invokes them from ArduinoOTA's
+    // callbacks). start's bool = sketch upload (vs FS image); end's bool = ok.
+    std::function<void(bool)> _otaStartEvent, _otaEndEvent;
+    std::function<void(unsigned int, unsigned int)> _otaProgressEvent;
     WiFiClient *_client = nullptr;
     HTTPClient *_httpClient = nullptr;
     bool _otaStarted = false;
@@ -287,6 +293,30 @@ public:
     void RegisterPingEvent(std::function<void()> evt)
     {
         _pingEvent = evt;
+    }
+    // OTA hooks. Safe to call before or after Setup(): stored here and pushed to
+    // _myOta on creation.
+    //   start(bool sketchUpload) — after LionWifi unmounts the FS (sketchUpload:
+    //                              true = sketch, false = filesystem image).
+    //   end(bool ok)             — on completion (ok=true) and on error (ok=false).
+    //   progress(prog, total)    — every ArduinoOTA progress callback, raw bytes.
+    void RegisterOtaStartEvent(std::function<void(bool)> evt)
+    {
+        _otaStartEvent = evt;
+        if (_myOta)
+            _myOta->SetOtaStartCallback(evt);
+    }
+    void RegisterOtaEndEvent(std::function<void(bool)> evt)
+    {
+        _otaEndEvent = evt;
+        if (_myOta)
+            _myOta->SetOtaEndCallback(evt);
+    }
+    void RegisterOtaProgressEvent(std::function<void(unsigned int, unsigned int)> evt)
+    {
+        _otaProgressEvent = evt;
+        if (_myOta)
+            _myOta->SetOtaProgressCallback(evt);
     }
 
     WiFiClient *SharedWifiClient()
@@ -485,7 +515,7 @@ public:
 
 #ifndef NO_MEMSTAT_IN_STATUS        
         // Memory stats
-        out.print(F("<div class='memory-status'>"));
+        out.print(F("<div class='global-status memory-status'>"));
 #ifndef ESP32
         out.printf_P(PSTR("Heap: <b>%u</b>B (loop min <b>%u</b>) | Frag: <b>%d%%</b> | Stack: <b>%u</b>B"),
                       freeHeap, _minFreeMemory, frag, freeStack);
@@ -493,13 +523,37 @@ public:
         out.printf_P(PSTR("Heap: <b>%u</b>B (min <b>%u</b>) | Largest: <b>%s</b> (%u%%)"),
                       freeHeap, _minFreeMemory, FsBrowser::FileSize(maxAlloc).c_str(), largestPct);
 #endif
-        out.print(F("</div><br>"));
+        out.print(F("</div>"));
+#endif
+
+#ifndef NO_WIFI_STAT_IN_STATUS
+        // WiFi radio diagnostics: a weak RSSI means retransmits → slow/failing
+        // OTA. Color-coded verdict so a bad link is obvious at a glance.
+        if (_connected)
+        {
+            int rssi = (int)WiFi.RSSI();
+            const __FlashStringHelper *rq;
+            const char *rcolor;
+            if (rssi >= -67)      { rq = F("good");            rcolor = "green"; }
+            else if (rssi >= -75) { rq = F("ok");              rcolor = "green"; }
+            else if (rssi >= -82) { rq = F("weak, OTA slow");  rcolor = "orange"; }
+            else                  { rq = F("POOR, OTA fails"); rcolor = "red"; }
+            out.printf_P(PSTR("<div class='global-status wifi-status'><span>WiFi <b>%s</b></span>&nbsp;<span>RSSI <b>%d</b> dBm &mdash; <b style='color:%s'>%S</b></span>&nbsp;<span>ch <b>%d</b></span></div>"),
+                         WiFi.SSID().c_str(), rssi, rcolor, rq, WiFi.channel());
+        }
 #endif
     }
 
     void Setup()
     {
         _myOta = new MyOta();
+        // Push any OTA hooks registered before Setup().
+        if (_otaStartEvent)
+            _myOta->SetOtaStartCallback(_otaStartEvent);
+        if (_otaEndEvent)
+            _myOta->SetOtaEndCallback(_otaEndEvent);
+        if (_otaProgressEvent)
+            _myOta->SetOtaProgressCallback(_otaProgressEvent);
 
 #if defined(ESP32) && !defined(NO_WIFI_TASK)
         RtosTask::Setup("WiFi", CORE_WIFI);

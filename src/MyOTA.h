@@ -16,6 +16,7 @@
 
 #include <ArduinoOTA.h>
 #include <Logger.h>
+#include <functional>
 
 #ifndef LIONWIFI_FS
 #error "Include FsBrowser.h before MyOTA.h (it selects the filesystem / defines LIONWIFI_FS)."
@@ -26,8 +27,24 @@ class MyOta
 private:
     int _otaPercent = -1;
     bool _sketchUpload = false;
+    // Consumer hooks (set via WifiConnector::RegisterOtaStart/Progress/EndEvent).
+    //   start   (bool sketchUpload)            — after the FS unmount; quiesce peripherals.
+    //                                            sketchUpload: true = sketch/U_FLASH,
+    //                                            false = filesystem image (fixed for
+    //                                            the whole session — stash it if end needs it).
+    //   end     (bool ok)                      — on completion (ok=true) AND on
+    //                                            error (ok=false), so the consumer
+    //                                            can restore state either way.
+    //   progress(unsigned prog, unsigned total)— every ArduinoOTA progress callback,
+    //                                            raw bytes; throttling is the consumer's call.
+    std::function<void(bool)> _onStart, _onEnd;
+    std::function<void(unsigned int, unsigned int)> _onProgress;
 
 public:
+    void SetOtaStartCallback(std::function<void(bool)> cb) { _onStart = cb; }
+    void SetOtaEndCallback(std::function<void(bool)> cb)   { _onEnd = cb; }
+    void SetOtaProgressCallback(std::function<void(unsigned int, unsigned int)> cb) { _onProgress = cb; }
+
     MyOta()
     {
         ArduinoOTA.onStart([this]()
@@ -37,15 +54,25 @@ public:
             if (!_sketchUpload) // unmount FS so the new FS image can be written
                 LIONWIFI_FS.end();
             _otaPercent = 0;
+            // After FS unmount: let the consumer quiesce heavy peripherals
+            // (e.g. stop HUB75 I2S-DMA) so they don't starve the OTA transfer.
+            if (_onStart)
+                _onStart(_sketchUpload);
         });
         ArduinoOTA.onEnd([this]()
         {
             Logger.Log_P(ILogger::LvlInfo, PSTR("OTA: End"));
             if (!_sketchUpload)
                 LIONWIFI_FS.begin();
+            if (_onEnd)
+                _onEnd(true); // ok
         });
         ArduinoOTA.onProgress([this](unsigned int progress, unsigned int total)
         {
+            // Raw progress to the consumer first (e.g. drive a progress bar);
+            // it fires on every callback — throttling is the consumer's call.
+            if (_onProgress)
+                _onProgress(progress, total);
             if (!total)
                 return;
             // Integer-safe percent: avoids divide-by-zero when total < 100
@@ -70,6 +97,10 @@ public:
                 Logger.Log_P(ILogger::LvlError, PSTR("Receive Failed"));
             else if (error == OTA_END_ERROR)
                 Logger.Log_P(ILogger::LvlError, PSTR("End Failed"));
+            // Also fire the end hook on failure so the consumer can restore
+            // whatever it quiesced in _onStart (there is no auto-reboot here).
+            if (_onEnd)
+                _onEnd(false); // error
         });
     }
 

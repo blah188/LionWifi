@@ -88,6 +88,28 @@ void setup()
     });
     _connector->SetPingTime(60000); // fire the ping callback once a minute
 
+    // --- OTA hooks: quiesce a heavy peripheral for the duration of an update ---
+    // (e.g. an ESP32-HUB75 I2S-DMA matrix that would otherwise starve the OTA).
+    // LionWifi keeps owning the FS unmount/remount; these just bracket it.
+    _connector->RegisterOtaStartEvent([](bool sketchUpload)
+    {
+        Logger.Log_P(ILogger::LvlInfo, PSTR("[ota] start (%S) — stopping peripherals"),
+                     sketchUpload ? F("sketch") : F("filesystem"));
+        // if (display) display->stopDMAoutput();
+    });
+    _connector->RegisterOtaProgressEvent([](unsigned int progress, unsigned int total)
+    {
+        // Fires on every chunk; throttle here if you drive a UI.
+        (void)progress; (void)total;
+    });
+    _connector->RegisterOtaEndEvent([](bool ok)
+    {
+        // ok=true → update done (device reboots shortly); ok=false → failed,
+        // no auto-reboot, so restore whatever was quiesced above.
+        Logger.Log_P(ILogger::LvlInfo, PSTR("[ota] end ok=%d"), ok);
+        // if (!ok && display) display->restartDMAoutput();
+    });
+
     _connector->Setup();
 
     // --- Custom /status route: render StatusHtml() straight to the response ---

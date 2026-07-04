@@ -70,6 +70,29 @@ Then browse `http://<device-ip>/`. Upload `examples/LionWifiBasic/data/index_nos
 to the filesystem as `/index_nosd.html` for a home page, or go straight to
 `/spiffs/ls`.
 
+## Events / callbacks
+
+Register these on the `WifiConnector` (before or after `Setup()`):
+
+| Method | Fires |
+| --- | --- |
+| `RegisterConnectedEvent(void())` | WiFi connected |
+| `RegisterDisconnectedEvent(void())` | WiFi lost |
+| `RegisterTimeSetEvent(void())` | NTP time acquired |
+| `RegisterClearLogEvent(void())` | old logs cleared |
+| `RegisterPingEvent(void())` | periodic tick (`SetPingTime(ms)`) |
+| `RegisterOtaStartEvent(void(bool sketchUpload))` | OTA begins, after LionWifi unmounts the FS |
+| `RegisterOtaProgressEvent(void(unsigned progress, unsigned total))` | every OTA progress callback (raw bytes) |
+| `RegisterOtaEndEvent(void(bool ok))` | OTA finished — `ok=true` success, `ok=false` error |
+
+The OTA hooks let a consumer quiesce a heavy peripheral (e.g. stop an
+ESP32-HUB75 I2S-DMA matrix that would otherwise starve the OTA transfer) for the
+duration of an update, while LionWifi keeps owning the FS unmount/remount and
+progress/error logging. `sketchUpload` is `true` for a sketch (`U_FLASH`) and
+`false` for a filesystem image (fixed for the whole session). The end hook fires
+on success **and** on error; on error there is no auto-reboot, so restore what
+you quiesced. See `examples/LionWifiFull`.
+
 ## Filesystem — pick exactly one
 
 Define **one** of these (a build with zero or both is a compile `#error`):
@@ -97,6 +120,11 @@ Override via `build_flags`. The full list lives in the header banner of
 | `NO_ASYNC_WEB_SERVER` (ESP32) | off | Use core `WebServer` instead of ESPAsyncWebServer |
 | `USE_SD_CARD` [+ `SDFAT`] | off | Also browse an SD card (SdFat with `SDFAT`) |
 | `LIONWIFI_NAME_MAX` | 63 | Max listed filename length (bytes); raise for long UTF-8 names |
+| `NO_MEMSTAT_IN_STATUS` | off | Drop heap/frag stats from the status page |
+| `NO_WIFI_STAT_IN_STATUS` | off | Drop the WiFi RSSI/quality/channel line from the status page (shown by default) |
+
+The status page's WiFi line carries a `wifi-status` CSS class (alongside
+`global-status`) so you can style it; it is emitted only while connected.
 
 ## HTTP endpoints
 

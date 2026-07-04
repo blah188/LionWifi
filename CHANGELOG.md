@@ -3,6 +3,34 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.1.0 — 2026-07-04
+
+### Added
+- OTA event hooks on `WifiConnector`, forwarded to `MyOta` (and safe to register
+  before or after `Setup()`): `RegisterOtaStartEvent(void(bool sketchUpload))`,
+  `RegisterOtaProgressEvent(void(unsigned progress, unsigned total))`,
+  `RegisterOtaEndEvent(void(bool ok))`. Lets a consumer quiesce heavy peripherals
+  (e.g. an ESP32-HUB75 I2S-DMA matrix) during OTA without replacing LionWifi's
+  own ArduinoOTA callbacks. Start fires after the FS unmount; end fires on
+  success (`ok=true`) and on error (`ok=false`). (#2)
+- `StatusHtml()` now renders a WiFi line (SSID, RSSI in dBm with a color-coded
+  good/ok/weak/poor verdict, and channel) after the memory stats. Shown by
+  default; disable with `-D NO_WIFI_STAT_IN_STATUS`. Carries a `wifi-status` CSS
+  class for styling and is emitted only while connected. (Consumers that
+  rendered this themselves after `StatusHtml()` — e.g. TempViewer_esp32 — can
+  drop their copy.)
+
+### Fixed
+- ESP32 async without `USE_SD_CARD`: the root path `"/"` was never registered, so
+  requesting `/` 404'd on `/index.html` instead of serving `index_nosd.html`. Now
+  registered in the ESP32-async branch, mirroring the sync path. (#1)
+
+### Changed
+- `StatusHtml()` no longer emits a trailing `<br>` after the memory-status block,
+  so consumers appending their own rows get consistent spacing (control vertical
+  gaps via CSS instead). Consumers that added a matching `<br>` to compensate can
+  drop it. (#3)
+
 ## 1.0.0 — 2026-06-30
 
 First public release. Extracted and hardened from a private monorepo
