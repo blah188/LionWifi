@@ -52,6 +52,8 @@
 //   LOG_CLEAR_DAYS           Keep dated logs this many days (default 14)
 //   MAX_LOG_BYTES, LOG_CLEAR_FREE_SPACE, FS_LOW_SPACE_THRESHOLD/TARGET,
 //   FS_SPACE_CHECK_INTERVAL_MS                Free-space / size watchdog tuning.
+//   HEAP_CHECK_INTERVAL_MS   Min gap between heap-stats samples (ESP8266, default
+//                            1000; getHeapStats walks the heap with IRQs off).
 //   NO_MEMSTAT_IN_STATUS     Drop heap/frag stats from the status page.
 //   NO_WIFI_STAT_IN_STATUS   Drop the WiFi RSSI/quality/channel line from the
 //                            status page (shown by default).
@@ -204,7 +206,9 @@ private:
 #ifdef FS_LOW_SPACE_THRESHOLD
     uint32_t _lastFreeSpaceCheck = 0;
 #endif
-    time_t _startupTime = 0;
+#ifndef ESP32
+    uint32_t _lastHeapCheckTime = 0;
+#endif
 #ifdef PING_ROUTER
     int _routerPingErrorsInRow = 0;
     int _routerPingSuccessesInRow = 0;
@@ -324,7 +328,12 @@ public:
         return _client;
     }
 
-    time_t GetStartupTime() { return _startupTime; }
+    // Derive the boot epoch from the monotonic clock (now - uptime) instead of a
+    // value latched at first sync. Self-heals if the clock is stepped afterwards
+    // (e.g. SNTP correcting an ESP32 RTC that jumped forward during an OTA reflash),
+    // so uptime never freezes or goes negative. (Wraps once per millis() rollover,
+    // ~49.7 d — a cosmetic blip on the status page.)
+    time_t GetStartupTime() { return _timeSet ? time(NULL) - (time_t)(millis() / 1000UL) : 0; }
 
     void StopSharedWifiClient()
     {
@@ -756,7 +765,6 @@ public:
             time(&now);
             if (now > MIN_VALID_EPOCH)
             {
-                _startupTime = now;
                 randomSeed(now);
                 _timeSet = true;
                 struct tm *timeinfo = localtime(&now);
@@ -832,14 +840,22 @@ public:
 #ifndef ESP32
         ESP.wdtFeed();
 
-        uint32_t hfree;
-        uint32_t hmax;
-        uint8_t hfrag;
-        ESP.getHeapStats(&hfree, &hmax, &hfrag);
-        if (hfree < _minFreeMemory)
+        // getHeapStats() walks the whole umm heap with interrupts disabled — throttle
+        // it (like the FS-space check above) instead of running it every Loop() pass.
+#ifndef HEAP_CHECK_INTERVAL_MS
+#define HEAP_CHECK_INTERVAL_MS 1000ul
+#endif
+        if (!_lastHeapCheckTime || millis() - _lastHeapCheckTime > HEAP_CHECK_INTERVAL_MS)
         {
-            _minFreeMemory = hfree;
-            Logger.Log_P(ILogger::LvlInfo, PSTR("====> New free heap = %lu (max %lu, frag %d)"), (unsigned long)_minFreeMemory, (unsigned long)hmax, hfrag);
+            _lastHeapCheckTime = millis();
+            uint32_t hfree, hmax;
+            uint8_t hfrag;
+            ESP.getHeapStats(&hfree, &hmax, &hfrag);
+            if (hfree < _minFreeMemory)
+            {
+                _minFreeMemory = hfree;
+                Logger.Log_P(ILogger::LvlInfo, PSTR("====> New free heap = %lu (max %lu, frag %d)"), (unsigned long)_minFreeMemory, (unsigned long)hmax, hfrag);
+            }
         }
 #else
         uint32_t free = ESP.getFreeHeap();
