@@ -3,6 +3,33 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.1.1 — 2026-07-08
+
+### Added
+- File-browser page (`/spiffs/ls`, `/sd/ls`) now ships a small built-in
+  stylesheet (light + dark theme, ~2 KB flash) and is fully restyleable via
+  documented, stable CSS classes (`.fs-wrap`, `.fs-table`, `td.name/.size/.time/
+  .actions`, `tr.dir`, `.fs-link`, `.act`, `.act-del`, `.fs-summary`, `.fs-home`,
+  `.fs-btn`). Configure with build flags: `-D FS_BROWSER_CSS="..."` replaces the
+  sheet (the default is exposed as `DEFAULT_FS_BROWSER_CSS` so you can prepend
+  overrides and append it back), `-D NO_FS_BROWSER_CSS` drops it entirely and
+  reclaims the ~2 KB. Copy-paste examples in `examples/LionWifiFull`.
+
+### Fixed
+- ESP8266: `ESP.getHeapStats()` ran on every `Loop()` pass — a full umm-heap walk
+  with interrupts disabled, thousands of times/sec. Now throttled (default 1 s,
+  `-D HEAP_CHECK_INTERVAL_MS`), matching the FS-space check; `ESP.wdtFeed()` still
+  runs every pass. (#5)
+- Uptime/"Restarted" on the status page could freeze or go negative when the clock
+  was stepped after boot (e.g. SNTP correcting an ESP32 RTC that jumped forward
+  during an OTA reflash). `GetStartupTime()` now derives the boot epoch from the
+  monotonic clock (`now - uptime`), so it self-heals. (#4)
+
+### Changed
+- File-browser markup modernized (`thead`/`tbody`/`tfoot`, `<meta viewport>`,
+  dropped `<font>` tags). Folder rows had an extra unlabeled `DIR` cell that
+  misaligned their columns; folders now show `DIR` in the Size column and line up.
+
 ## 1.1.0 — 2026-07-04
 
 ### Added

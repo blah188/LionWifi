@@ -19,6 +19,27 @@
 // with -D WIFI_SSID / -D WIFI_PASSWORD.
 
 #include <Logger.h>
+
+// ---- Restyling the file-browser page (/spiffs/ls) ---------------------------
+// These macros are read inside FsBrowser.h, so they must be #define'd BEFORE
+// <WifiConnector.h> (which includes it). In an .ino that means right here; in a
+// PlatformIO project you'd usually pass the same thing via build_flags instead
+// (e.g. -D NO_FS_BROWSER_CSS). All are OFF here so the example shows the default
+// look — uncomment ONE to try it.
+//
+// (a) Turn styling off entirely — no <style>, plain browser table, saves ~2 KB:
+// #define NO_FS_BROWSER_CSS
+//
+// (b) Keep the built-in sheet but re-theme it — prepend var overrides, then
+//     append the exposed default (adjacent string literals concatenate):
+// #define FS_BROWSER_CSS ":root{--fs-accent:#0aa;--fs-danger:#e11}" DEFAULT_FS_BROWSER_CSS
+//
+// (c) Replace the stylesheet completely with your own (flash cost = your string):
+// #define FS_BROWSER_CSS "body{font-family:monospace;margin:1rem}" \
+//                        ".fs-table{border-collapse:collapse}" \
+//                        ".fs-table td,.fs-table th{border:1px solid #999;padding:4px 8px}" \
+//                        ".act-del{color:#c00}"
+
 #include <WifiConnector.h>
 
 // ServerStream is the synchronous-server streaming sink (not used on async).

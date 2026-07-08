@@ -122,9 +122,35 @@ Override via `build_flags`. The full list lives in the header banner of
 | `LIONWIFI_NAME_MAX` | 63 | Max listed filename length (bytes); raise for long UTF-8 names |
 | `NO_MEMSTAT_IN_STATUS` | off | Drop heap/frag stats from the status page |
 | `NO_WIFI_STAT_IN_STATUS` | off | Drop the WiFi RSSI/quality/channel line from the status page (shown by default) |
+| `FS_BROWSER_CSS` | built-in | Replace the file-browser stylesheet (string literal) |
+| `NO_FS_BROWSER_CSS` | off | Drop the file-browser stylesheet — saves ~2 KB flash |
 
 The status page's WiFi line carries a `wifi-status` CSS class (alongside
 `global-status`) so you can style it; it is emitted only while connected.
+
+### Styling the file browser
+
+The directory page (`/spiffs/ls`, `/sd/ls`) ships a small light/dark stylesheet
+that costs **~2.0 KB of flash** (the CSS string is ~2012 bytes). Three ways to
+change it, cheapest first:
+
+1. **Re-theme** — every color is a CSS custom property (`--fs-bg`, `--fs-fg`,
+   `--fs-card`, `--fs-line`, `--fs-muted`, `--fs-accent`, `--fs-danger`; each has
+   a dark value). Prepend a `:root{…}` override and keep the default rules:
+   ```ini
+   build_flags = -D FS_BROWSER_CSS='":root{--fs-accent:#0aa}" DEFAULT_FS_BROWSER_CSS'
+   ```
+   (or just define `FS_BROWSER_CSS` in a force-included config header).
+2. **Replace** the whole sheet with your own — `-D FS_BROWSER_CSS='"…css…"'`.
+   Flash cost becomes the length of *your* string. Keep the class names
+   (`.fs-wrap`, `.fs-table`, `td.name/.size/.time/.actions`, `tr.dir`, `.fs-link`,
+   `.act`, `.act-del`, `.fs-summary`, `.fs-home`, `.fs-btn`) so the markup matches.
+3. **Turn it off** — `-D NO_FS_BROWSER_CSS` emits no `<style>`; the page falls
+   back to the browser's plain default table (still fully functional) and you
+   reclaim the full ~2 KB. The full class list is documented in `FsBrowser.h`.
+
+Copy-paste examples for all three (as `#define`s or `build_flags`) are in
+`examples/LionWifiFull` — the macros must be set **before** `<WifiConnector.h>`.
 
 ## HTTP endpoints
 

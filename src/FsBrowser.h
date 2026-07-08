@@ -92,6 +92,82 @@ extern const char __text_html__P[];
 extern const char __slash_favicon_ico__P[];
 #define __slash_favicon_ico__F FPSTR(__slash_favicon_ico__P)
 
+// ---- File-listing look & feel ----------------------------------------------
+// The directory page (/spiffs/ls, /sd/ls) ships a small built-in stylesheet
+// (light + dark theme). It costs ~2.0 KB of flash (the CSS string is ~2012 B).
+// It is fully configurable WITHOUT editing this library — pick the level of
+// control you need:
+//
+//  1. TWEAK the palette / add rules while KEEPING the built-in sheet. The default
+//     is exposed as the macro DEFAULT_FS_BROWSER_CSS, so prepend your overrides
+//     and append it back (adjacent string literals concatenate):
+//         #define FS_BROWSER_CSS ":root{--fs-accent:#0aa}" DEFAULT_FS_BROWSER_CSS
+//     Every color is a :root custom property, so a one-line var override re-themes
+//     everything. Vars: --fs-bg --fs-fg --fs-card --fs-line --fs-muted
+//           --fs-accent --fs-danger   (each has a dark-theme value in @media).
+//
+//  2. REPLACE the whole stylesheet:  -D FS_BROWSER_CSS='"...your css..."'
+//     (a string literal). Easiest from a force-included config header:
+//         #define FS_BROWSER_CSS ".fs-table{font-size:16px;width:100%}"
+//     Flash cost then = the length of YOUR string instead of ~2 KB. Keep the
+//     class names below so the markup still targets your rules.
+//
+//  3. TURN IT OFF:  -D NO_FS_BROWSER_CSS
+//     Emits no <style> at all — the page falls back to the browser's default
+//     table (plain, but fully functional). Saves the full ~2.0 KB of flash.
+//     Combine with option 2 in your own page wrapper if you serve CSS elsewhere.
+//
+// Stable class names the markup uses (target these from options 1/2):
+//   .fs-wrap      page container (centered, max-width)
+//   .fs-upload    the upload <form> row
+//   .fs-btn       the Upload submit button
+//   .fs-table     the listing <table>            (thead / tbody / tfoot)
+//   th/td.name    filename column   (td.name holds .fs-link for files)
+//   th/td.size    size column       (shows "DIR" for folders)
+//   th/td.time    created/modified columns       (only with USE_FILE_TIME)
+//   th/td.actions action column
+//   tr.dir        a folder row
+//   .fs-link      the filename link (download)
+//   .act          an action link (Tail / Download)
+//   .act-del      the Delete action link (danger color)
+//   .fs-summary   the Total/Free footer rows
+//   .fs-home      the "Home" link under the table
+#ifndef NO_FS_BROWSER_CSS
+// The built-in sheet is exposed as DEFAULT_FS_BROWSER_CSS so you can KEEP it and
+// just prepend overrides:  -D FS_BROWSER_CSS='":root{--fs-accent:#0aa}" DEFAULT_FS_BROWSER_CSS'
+#define DEFAULT_FS_BROWSER_CSS \
+":root{--fs-bg:#f3f4f6;--fs-fg:#1f2937;--fs-card:#fff;--fs-line:#e5e7eb;--fs-muted:#6b7280;--fs-accent:#6366f1;--fs-danger:#dc2626;}" \
+"*{box-sizing:border-box;}" \
+"body{margin:0;padding:24px;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;background:var(--fs-bg);color:var(--fs-fg);font-size:14px;line-height:1.45;}" \
+".fs-wrap{max-width:900px;margin:0 auto;}" \
+".fs-upload{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 16px;}" \
+".fs-btn{background:var(--fs-accent);color:#fff;border:0;border-radius:8px;padding:8px 16px;font:inherit;cursor:pointer;}" \
+".fs-btn:hover{filter:brightness(1.08);}" \
+".fs-table{width:100%;border-collapse:collapse;background:var(--fs-card);border:1px solid var(--fs-line);border-radius:12px;overflow:hidden;}" \
+".fs-table th,.fs-table td{padding:8px 12px;text-align:left;border-bottom:1px solid var(--fs-line);}" \
+".fs-table th{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--fs-muted);background:rgba(0,0,0,.02);}" \
+".fs-table tbody tr:hover{background:rgba(99,102,241,.06);}" \
+".fs-table .size{white-space:nowrap;color:var(--fs-muted);}" \
+".fs-table .time{white-space:nowrap;color:var(--fs-muted);font-size:12px;}" \
+".fs-table .actions{white-space:nowrap;}" \
+".fs-link{color:var(--fs-fg);text-decoration:none;font-weight:500;}" \
+".fs-link:hover{color:var(--fs-accent);text-decoration:underline;}" \
+"tr.dir .name{color:var(--fs-muted);font-weight:600;}" \
+".act{color:var(--fs-accent);text-decoration:none;margin-right:10px;font-size:13px;}" \
+".act:hover{text-decoration:underline;}" \
+".act-del{color:var(--fs-danger);}" \
+".fs-summary td{color:var(--fs-muted);font-weight:600;border-bottom:0;}" \
+".fs-home{display:inline-block;margin-top:16px;color:var(--fs-accent);text-decoration:none;}" \
+".fs-home:hover{text-decoration:underline;}" \
+"@media(prefers-color-scheme:dark){" \
+":root{--fs-bg:#0f172a;--fs-fg:#e5e7eb;--fs-card:#1e293b;--fs-line:#334155;--fs-muted:#94a3b8;--fs-accent:#a78bfa;--fs-danger:#f87171;}" \
+".fs-table th{background:rgba(255,255,255,.03);}" \
+".fs-table tbody tr:hover{background:rgba(167,139,250,.10);}}"
+#ifndef FS_BROWSER_CSS
+#define FS_BROWSER_CSS DEFAULT_FS_BROWSER_CSS
+#endif
+#endif
+
 struct FileSystemStats
 {
     uint64_t totalSize, freeSize;
@@ -730,7 +806,8 @@ public:
         // churn. Both are Print, so the row-building code below is shared.
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
         String buffer;
-        buffer.reserve(512 + (size_t)files.Length() * 180); // ~180 B/row
+        // head + built-in <style> (~1.5 KB) + one row per file (~230 B/row).
+        buffer.reserve(2048 + (size_t)files.Length() * 230);
         StringStream out(buffer);
         rtc_wdt_feed();
 #else
@@ -747,12 +824,17 @@ public:
         _server.send(200, __text_html__F, "");
         ServerStream out(_server);
 #endif
-        out.printf_P(PSTR("<!doctype html><html><head><meta charset=\"utf-8\"></head><body> <form method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"> <input class=\"button\" type=\"submit\" value=\"Upload\"></form>"));
-        out.printf_P(PSTR("<table><tr><td><b>Name</b></td></td><td><b>Size</b></td>"));
-#ifdef USE_FILE_TIME
-        out.printf_P(PSTR("<td><b>Created</b></td><td><b>Modified</b></td>"));
+        out.print(F("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Files</title>"));
+#ifndef NO_FS_BROWSER_CSS
+        out.print(F("<style>" FS_BROWSER_CSS "</style>"));
 #endif
-        out.printf_P(PSTR("<td><b>Action</b></td></tr>\n"));
+        out.print(F("</head><body><div class=\"fs-wrap\">"
+                    "<form class=\"fs-upload\" method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"><input class=\"fs-btn\" type=\"submit\" value=\"Upload\"></form>"
+                    "<table class=\"fs-table\"><thead><tr><th class=\"name\">Name</th><th class=\"size\">Size</th>"));
+#ifdef USE_FILE_TIME
+        out.print(F("<th class=\"time\">Created</th><th class=\"time\">Modified</th>"));
+#endif
+        out.print(F("<th class=\"actions\">Action</th></tr></thead><tbody>\n"));
 
         for (int i = 0; i < files.Length(); i++)
         {
@@ -762,26 +844,26 @@ public:
             String enc = UrlEncode(entry.fullName);
 
             if (entry.isFolder) // subfolders are listed but not navigable (flat listing)
-                out.printf_P(PSTR("<tr> <td> %s</td><td>%s</td><td>DIR</td>"),
-                             entry.fullName, FileSize(entry.size).c_str());
+                out.printf_P(PSTR("<tr class=\"dir\"><td class=\"name\">%s</td><td class=\"size\">DIR</td>"),
+                             entry.fullName);
             else
-                out.printf_P(PSTR("<tr> <td> <a href=\"%s\">%s</a></td><td>%s</td>"),
+                out.printf_P(PSTR("<tr><td class=\"name\"><a class=\"fs-link\" href=\"%s\">%s</a></td><td class=\"size\">%s</td>"),
                              enc.c_str(), entry.fullName, FileSize(entry.size).c_str());
 #ifdef USE_FILE_TIME
-            out.printf_P(PSTR("<td><font size=\"-1\">%s</font></td><td><font size=\"-1\">%s</font></td>"),
+            out.printf_P(PSTR("<td class=\"time\">%s</td><td class=\"time\">%s</td>"),
                          FileTime(entry.creationTime).c_str(), FileTime(entry.writeTime).c_str());
 #endif
             if (entry.isFolder)
-                out.printf_P(PSTR("<td></td></tr>"));
+                out.print(F("<td class=\"actions\"></td></tr>\n"));
             else
             {
                 if (sd)
-                    out.printf_P(PSTR("<td><a href=\"/sd/tail/%s\">Tail</a>&nbsp<a href=\"/sd/download/%s\">Download</a>&nbsp<a href=\"/sd/del/%s\""),
+                    out.printf_P(PSTR("<td class=\"actions\"><a class=\"act\" href=\"/sd/tail/%s\">Tail</a><a class=\"act\" href=\"/sd/download/%s\">Download</a><a class=\"act act-del\" href=\"/sd/del/%s\""),
                                  enc.c_str(), enc.c_str(), enc.c_str());
                 else
-                    out.printf_P(PSTR("<td><a href=\"/tail/%s\">Tail</a>&nbsp<a href=\"/download/%s\">Download</a>&nbsp<a href=\"/del/%s\""),
+                    out.printf_P(PSTR("<td class=\"actions\"><a class=\"act\" href=\"/tail/%s\">Tail</a><a class=\"act\" href=\"/download/%s\">Download</a><a class=\"act act-del\" href=\"/del/%s\""),
                                  enc.c_str(), enc.c_str(), enc.c_str());
-                out.printf_P(PSTR(" onclick=\"return confirm('Are you sure to delete %s?')\">DEL</a></td></tr>"), entry.fullName);
+                out.printf_P(PSTR(" onclick=\"return confirm('Are you sure to delete %s?')\">Delete</a></td></tr>\n"), entry.fullName);
             }
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
             rtc_wdt_feed();
@@ -789,9 +871,17 @@ public:
         }
 
         FileSystemStats stats = GetFsStats(sd);
-        out.printf_P(PSTR("<tr><td>Total:</td><td>%s</td><td></td></tr>\n<tr><td>Free:</td><td>%s</td><td></td></tr>\n</table> <a href=\"/\">Home</a></body>"),
+        out.print(F("</tbody><tfoot>"));
+#ifdef USE_FILE_TIME
+        out.printf_P(PSTR("<tr class=\"fs-summary\"><td class=\"name\">Total</td><td class=\"size\">%s</td><td colspan=\"3\"></td></tr>"
+                          "<tr class=\"fs-summary\"><td class=\"name\">Free</td><td class=\"size\">%s</td><td colspan=\"3\"></td></tr>"),
                      FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
-        out.printf_P(PSTR("</html>"));
+#else
+        out.printf_P(PSTR("<tr class=\"fs-summary\"><td class=\"name\">Total</td><td class=\"size\">%s</td><td></td></tr>"
+                          "<tr class=\"fs-summary\"><td class=\"name\">Free</td><td class=\"size\">%s</td><td></td></tr>"),
+                     FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
+#endif
+        out.print(F("</tfoot></table><a class=\"fs-home\" href=\"/\">Home</a></div></body></html>"));
 
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
         request->send(200, __text_html__F, buffer);
