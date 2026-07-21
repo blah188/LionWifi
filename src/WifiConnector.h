@@ -59,6 +59,15 @@
 //                            status page (shown by default).
 //   LOG_FAVICON              Also log favicon.ico requests.
 //
+//   HTTP OTA (opt-in):
+//   LIONWIFI_HTTP_OTA        Add a /update endpoint (browser/curl firmware upload,
+//                            a forward POST). Works across NAT/subnets where
+//                            ArduinoOTA's reverse connection can't reach back.
+//                            Hand-rolled on every backend: the RegisterOta* hooks
+//                            fire and progress is logged via Logger. The GET page
+//                            flashes either the sketch or a filesystem image
+//                            (?fs=1). Basic auth via WEB_SERVER_AUTH_* / NO_AUTH.
+//
 //   ESP32-specific:
 //   NO_WIFI_TASK             Run Loop() from your loop() instead of a FreeRTOS task.
 //   NO_ASYNC_WEB_SERVER      Use the sync WebServer instead of ESPAsyncWebServer.
@@ -81,6 +90,7 @@
 //                                 (full / last 8 KB). Added by WifiConnector::Setup,
 //                                 served via FsBrowser from Logger.GetLogFileName().
 //   GET /restart                  Reboot the device
+//   GET/POST /update              Sketch or FS-image upload + reboot (with -D LIONWIFI_HTTP_OTA)
 //   GET /format                   Format the FS (ESP8266 / ESP32-sync only)
 //   GET /logout                   Clear HTTP Basic auth (401)
 //   GET /favicon.ico              Served from the filesystem
@@ -126,6 +136,28 @@ extern "C"
 
 #include <FsBrowser.h> // defines LIONWIFI_FS (the selected filesystem)
 #include <MyOTA.h>      // uses LIONWIFI_FS, so it must come after FsBrowser.h
+
+#ifdef LIONWIFI_HTTP_OTA
+// Browser/curl firmware upload at /update (a FORWARD POST, unlike ArduinoOTA's
+// reverse connection) — works across NAT/subnets where espota can't reach back.
+// Hand-rolled on every backend (drives the Update object directly) so the OTA
+// hooks fire and progress is logged through the global Logger uniformly.
+#ifdef ESP32
+#include <Update.h>
+#else
+#include <flash_hal.h> // FS_start / FS_end bound the FS partition (to size an FS-image OTA)
+// (the Update object itself comes from the ESP8266 core via ESP8266WiFi.h above)
+#endif
+// The /update GET page: one form flashes the sketch, the other a filesystem image
+// (?fs=1 + field name "filesystem" select the FS target on every backend).
+#define LIONWIFI_OTA_FORM_HTML                                                 \
+    "<h3>Firmware</h3>"                                                        \
+    "<form method='POST' action='/update' enctype='multipart/form-data'>"     \
+    "<input type='file' name='fw'><input type='submit' value='Flash'></form>" \
+    "<h3>Filesystem</h3>"                                                      \
+    "<form method='POST' action='/update?fs=1' enctype='multipart/form-data'>" \
+    "<input type='file' name='filesystem'><input type='submit' value='Flash'></form>"
+#endif
 
 #ifndef LOG_CLEAR_EVERY_HOURS
 #define LOG_CLEAR_EVERY_HOURS 4
@@ -227,6 +259,9 @@ private:
     WiFiClient *_client = nullptr;
     HTTPClient *_httpClient = nullptr;
     bool _otaStarted = false;
+#ifdef LIONWIFI_HTTP_OTA
+    bool _httpOtaAuthOk = false; // latched when the upload starts; response gated on it
+#endif
 
 public:
     void SetPingTime(uint32_t pt) { _pingEveryMs = pt; }
@@ -553,6 +588,131 @@ public:
 #endif
     }
 
+#ifdef LIONWIFI_HTTP_OTA
+    // Registers /update: GET shows an upload form, POST flashes the firmware and
+    // reboots. FORWARD upload (curl/browser → device), so it works across NAT /
+    // subnets where ArduinoOTA's reverse connection can't reach back. HTTP Basic
+    // auth (WEB_SERVER_AUTH_*), or open with -D NO_AUTH. Fires the OTA hooks on
+    // the async path. Call from Setup() after the browser routes are registered.
+    void SetupHttpOta()
+    {
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+        server.on("/update", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            request->send(200, F("text/html"), F(LIONWIFI_OTA_FORM_HTML)); });
+        server.on(
+            "/update", HTTP_POST,
+            [this](AsyncWebServerRequest *request)
+            {
+                if (!_httpOtaAuthOk) { request->requestAuthentication(); return; }
+                bool ok = !Update.hasError();
+                if (_otaEndEvent) _otaEndEvent(ok);
+                AsyncWebServerResponse *resp = request->beginResponse(200, __text_plain__F, ok ? F("Update OK - rebooting") : F("Update FAILED"));
+                resp->addHeader(F("Connection"), F("close"));
+                request->send(resp);
+                if (ok) { delay(100); ESP.restart(); }
+            },
+            [this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final)
+            {
+                if (!index) // first chunk: authenticate, then open the update
+                {
+#ifdef NO_AUTH
+                    _httpOtaAuthOk = true;
+#else
+                    _httpOtaAuthOk = request->authenticate(WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
+#endif
+                    if (!_httpOtaAuthOk) return; // reject unauthenticated uploads outright
+                    bool fs = request->hasParam("fs"); // ?fs=1 → flash a filesystem image
+                    Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: start %s (%s)"), filename.c_str(), fs ? "FS" : "sketch");
+                    if (_otaStartEvent) _otaStartEvent(!fs); // sketchUpload = !fs
+                    if (fs)
+                    {
+                        LIONWIFI_FS.end(); // unmount before writing the FS partition
+                        Update.begin(UPDATE_SIZE_UNKNOWN, U_SPIFFS);
+                    }
+                    else
+                        Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+                }
+                if (!_httpOtaAuthOk) return;
+                if (Update.write(data, len) != len)
+                    Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
+                if (_otaProgressEvent) _otaProgressEvent((unsigned int)(index + len), 0);
+                if (final)
+                {
+                    if (Update.end(true))
+                        Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: %u bytes, OK"), (unsigned int)(index + len));
+                    else
+                        Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: end failed"));
+                }
+            });
+#else // sync server (ESP8266 / ESP32 core WebServer) — hand-rolled for uniform logs + hooks
+        server.on(F("/update"), HTTP_GET, [this]()
+                  {
+            if (!_fsBrowser->DoAuth()) return;
+            server.send(200, F("text/html"), F(LIONWIFI_OTA_FORM_HTML)); });
+        server.on(
+            F("/update"), HTTP_POST,
+            [this]() // onRequest: runs after the upload — send result + reboot
+            {
+                if (!_httpOtaAuthOk) { server.requestAuthentication(); return; }
+                bool ok = !Update.hasError();
+                if (_otaEndEvent) _otaEndEvent(ok);
+                server.send(200, __text_plain__F, ok ? F("Update OK - rebooting") : F("Update FAILED"));
+                delay(100);
+                if (ok) ESP.restart();
+            },
+            [this]() // upload handler — drives Update chunk by chunk
+            {
+                HTTPUpload &up = server.upload();
+                if (up.status == UPLOAD_FILE_START)
+                {
+#ifdef NO_AUTH
+                    _httpOtaAuthOk = true;
+#else
+                    _httpOtaAuthOk = server.authenticate(WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
+#endif
+                    if (!_httpOtaAuthOk) return; // reject unauthenticated uploads outright
+                    bool fs = server.hasArg("fs") || up.name == "filesystem"; // FS-image target
+                    Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: start %s (%s)"), up.filename.c_str(), fs ? "FS" : "sketch");
+                    if (_otaStartEvent) _otaStartEvent(!fs); // sketchUpload = !fs
+                    if (fs)
+                    {
+                        LIONWIFI_FS.end(); // unmount before writing the FS partition
+#ifdef ESP32
+                        Update.begin(UPDATE_SIZE_UNKNOWN, U_SPIFFS);
+#else
+                        Update.begin((size_t)FS_end - (size_t)FS_start, U_FS);
+#endif
+                    }
+                    else
+                    {
+#ifdef ESP32
+                        Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+#else
+                        Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000, U_FLASH);
+#endif
+                    }
+                }
+                else if (up.status == UPLOAD_FILE_WRITE && _httpOtaAuthOk)
+                {
+                    if (Update.write(up.buf, up.currentSize) != up.currentSize)
+                        Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
+                    if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, 0);
+                }
+                else if (up.status == UPLOAD_FILE_END && _httpOtaAuthOk)
+                {
+                    if (Update.end(true))
+                        Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: %u bytes, OK"), (unsigned int)up.totalSize);
+                    else
+                        Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: end failed"));
+                }
+            });
+#endif
+        Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA ready at /update"));
+    }
+#endif
+
     void Setup()
     {
         _myOta = new MyOta();
@@ -641,6 +801,10 @@ public:
 
         _fsBrowser = new FsBrowser(server, WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
         _fsBrowser->AddRoutes();
+
+#ifdef LIONWIFI_HTTP_OTA
+        SetupHttpOta(); // browser/curl firmware upload at /update (forward POST)
+#endif
 
 #if !defined(ESP32) || defined(NO_WIFI_TASK)
         if (_on)

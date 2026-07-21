@@ -93,6 +93,55 @@ progress/error logging. `sketchUpload` is `true` for a sketch (`U_FLASH`) and
 on success **and** on error; on error there is no auto-reboot, so restore what
 you quiesced. See `examples/LionWifiFull`.
 
+## OTA (firmware updates)
+
+Two independent mechanisms:
+
+- **ArduinoOTA** (always on) — the usual `espota`/PlatformIO `upload_protocol = espota`
+  flow. Note it's a **reverse** connection: the host invites the device, then the
+  **device connects back** to the host. That fails across NAT / separate subnets /
+  VPN segments where the device can't reach the host.
+- **HTTP OTA** (opt-in, `-D LIONWIFI_HTTP_OTA`) — a `/update` endpoint that accepts
+  a **forward** firmware POST (host → device), so it works wherever the device's
+  web UI is reachable, including across NAT. Upload from a browser (open
+  `http://<device>/update`, which offers a sketch and a filesystem form) or curl:
+
+  ```bash
+  # sketch
+  curl -u user:pass -F "fw=@.pio/build/<env>/firmware.bin" http://<device>/update
+  # filesystem image (SPIFFS/LittleFS)
+  curl -u user:pass -F "filesystem=@.pio/build/<env>/spiffs.bin" http://<device>/update
+  ```
+
+  Or drive it from PlatformIO with a dedicated env that reuses your normal build
+  but uploads over HTTP (so `espota` stays the default for `[env:release]`):
+  ```ini
+  [env:release-http]
+  extends = env:release            ; same board / flags / lib_deps as the real build
+  upload_protocol = custom
+  upload_port = 192.168.1.50       ; device IP, exposed to the command as $UPLOAD_PORT
+  upload_command = curl -u user:pass -F "fw=@$SOURCE" http://$UPLOAD_PORT/update
+  ```
+  Then `pio run -e release-http -t upload` builds and flashes over HTTP; for a
+  filesystem image, `pio run -e release-http -t buildfs` then curl the built
+  `spiffs.bin`/`littlefs.bin` with `-F "filesystem=@..."`. Notes:
+
+  - **Bootstrap once over `espota`/USB** — `/update` only exists after a build with
+    `-D LIONWIFI_HTTP_OTA` is on the device; after that, HTTP OTA reflashes itself.
+  - PlatformIO warns that an IP `upload_port` "looks like `espota`" — harmless, the
+    `custom` protocol still runs your `upload_command`. (Drop `upload_port` and
+    hard-code the IP in the command to silence it.)
+
+  Hand-rolled on every backend (ESP8266, ESP32-sync, ESP32-async): it drives the
+  `Update` object directly, so the `RegisterOta*` hooks fire and progress is logged
+  through the global `Logger` (`HTTP OTA: start … (sketch|FS)` / `… OK`) everywhere.
+  The FS target is chosen by `?fs=1` (and, on the sync servers, the `filesystem`
+  upload field name); it unmounts the FS and flashes the FS partition. Auth via
+  `WEB_SERVER_AUTH_*` (or `NO_AUTH`); the device reboots on success.
+
+  > **Note:** sketch OTA is tested; **filesystem-image OTA is not yet verified on
+  > hardware** — treat it as experimental until confirmed.
+
 ## Filesystem — pick exactly one
 
 Define **one** of these (a build with zero or both is a compile `#error`):
@@ -111,6 +160,7 @@ Override via `build_flags`. The full list lives in the header banner of
 | `USE_SPIFFS` / `LFS` | — | Filesystem (define exactly one) |
 | `WEB_SERVER_AUTH_USER` / `WEB_SERVER_AUTH_PASSWORD` | `admin`/`admin` | HTTP Basic auth — **change these** |
 | `NO_AUTH` | off | Disable HTTP auth entirely |
+| `LIONWIFI_HTTP_OTA` | off | Add a `/update` firmware-upload endpoint (forward POST) |
 | `NTP_TZ_OFFSET_SEC` / `NTP_SERVER` | `7*3600` / `pool.ntp.org` | Time zone offset / NTP host |
 | `WIFI_CONNECT_TIMEOUT` | `20000` | Per-AP attempt (ms) before rotating SSID |
 | `WIFI_FATAL_CONNECT_TIMEOUT` | `180000` | Reboot after this long disconnected (ms) |
@@ -157,6 +207,7 @@ Copy-paste examples for all three (as `#define`s or `build_flags`) are in
 `/` (home) · `/spiffs/ls` (list + upload) · `/tail/<f>` · `/download/<f>` ·
 `/spiffs/<f>` · `/del<f>` · `/log`, `/log/tail`, `/spiffs/log[/tail]`
 (LionLogger's current-day log) · `/restart` · `/format` (ESP8266 / ESP32-sync) ·
+`/update` (firmware upload, with `LIONWIFI_HTTP_OTA`) ·
 `/logout` · `/favicon.ico` · `/lion-tasks` (ESP8266). With `USE_SD_CARD`:
 `/sd/ls`, `/sd/tail/<f>`, `/sd/download/<f>`, `/sd/del/<f>` (flat — no subfolders).
 

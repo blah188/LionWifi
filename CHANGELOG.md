@@ -3,6 +3,22 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.2.0 — 2026-07-21
+
+### Added
+- HTTP OTA (opt-in, `-D LIONWIFI_HTTP_OTA`): a `/update` endpoint that flashes
+  firmware from a **forward** POST (browser or `curl -F "fw=@firmware.bin"`),
+  unlike ArduinoOTA's reverse connection — so it works across NAT / separate
+  subnets / VPN segments where `espota` can't connect back to the host.
+  Hand-rolled on every backend (ESP8266, ESP32-sync, ESP32-async) so it drives
+  the `Update` object directly: the `RegisterOta*` hooks fire and progress is
+  logged through the global `Logger` uniformly (`HTTP OTA: start …` / `… OK`).
+  The GET page offers two forms — sketch and **filesystem image**; the FS target
+  is selected by `?fs=1` (and, on the sync servers, the `filesystem` field name),
+  which unmounts the FS and flashes the FS partition. HTTP Basic auth via
+  `WEB_SERVER_AUTH_*` (or `-D NO_AUTH`); reboots on success. (Sketch OTA is tested;
+  filesystem-image OTA is not yet hardware-verified — treat it as experimental.)
+
 ## 1.1.1 — 2026-07-08
 
 ### Added
