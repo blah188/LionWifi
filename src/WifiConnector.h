@@ -209,6 +209,23 @@ extern "C"
 #define MIN_VALID_EPOCH 1546300800
 #endif
 
+// --- RTC-persisted wall clock (ESP32) -----------------------------------------
+// ESP-IDF does NOT carry SNTP-corrected time across a reset — even a clean
+// esp_restart reverts to the drifting raw RTC — so boot-time logs and LionLogger's
+// day-file name render at the wrong time until SNTP re-syncs. We snapshot valid time
+// into RTC_NOINIT memory (survives a SW reset; lost on power loss → magic mismatch)
+// and restore it at boot via the static RestoreClockFromRtc().
+// Enabled by default on ESP32; turn OFF with -D LIONWIFI_NO_RTC_CLOCK.
+#if defined(ESP32) && !defined(LIONWIFI_NO_RTC_CLOCK)
+#define LIONWIFI_RTC_CLOCK
+#endif
+#ifdef LIONWIFI_RTC_CLOCK
+#include <sys/time.h>
+extern uint32_t _lwRtcSavedEpoch; // defined once in WifiConnector.cpp
+extern uint32_t _lwRtcSavedMagic;
+#define LIONWIFI_RTC_TIME_MAGIC 0x4C57524Dul // 'LWRM'
+#endif
+
 #ifdef ESP32
 #ifdef NO_ASYNC_WEB_SERVER
 extern WebServer server;
@@ -312,6 +329,38 @@ public:
     // would alias and double-manage them. Non-copyable by design.
     WifiConnector(const WifiConnector &) = delete;
     WifiConnector &operator=(const WifiConnector &) = delete;
+
+    // Call FIRST in setup(), before any timestamped logging. On ESP32 it sets the TZ
+    // offset early (so boot logs before Setup() are in local time) and, when
+    // LIONWIFI_RTC_CLOCK is enabled, restores the last-saved wall clock from RTC
+    // memory. Static — usable before the WifiConnector object exists.
+    static void RestoreClockFromRtc()
+    {
+#ifdef ESP32
+        configTime(NTP_TZ_OFFSET_SEC, 0, NTP_SERVER); // TZ before first log; SNTP also (re)inits on connect
+#ifdef LIONWIFI_RTC_CLOCK
+        if (_lwRtcSavedMagic == LIONWIFI_RTC_TIME_MAGIC && _lwRtcSavedEpoch > (uint32_t)MIN_VALID_EPOCH)
+        {
+            struct timeval tv = { (time_t)_lwRtcSavedEpoch, 0 };
+            settimeofday(&tv, NULL);
+        }
+#endif
+#endif
+    }
+
+    // Snapshot the current valid wall clock into RTC memory (cheap SRAM write, no
+    // flash). No-op unless LIONWIFI_RTC_CLOCK and time is set. Called each Loop().
+    static void SaveClockToRtc()
+    {
+#ifdef LIONWIFI_RTC_CLOCK
+        time_t now = time(NULL);
+        if ((uint32_t)now > (uint32_t)MIN_VALID_EPOCH)
+        {
+            _lwRtcSavedEpoch = (uint32_t)now;
+            _lwRtcSavedMagic = LIONWIFI_RTC_TIME_MAGIC;
+        }
+#endif
+    }
 
     void RegisterConnectedEvent(std::function<void()> evt)
     {
@@ -715,6 +764,14 @@ public:
 
     void Setup()
     {
+        // Apply the TZ offset immediately at boot — not only in configTime() on
+        // connect (below). On ESP32 the RTC keeps running across a SW reset, so
+        // until WiFi connects localtime() would render boot-time logs (and
+        // LionLogger's localtime-derived day-file name) in UTC, scattering entries
+        // into the wrong day file around local midnight. Re-called with the server
+        // on connect to (re)start SNTP; here it just sets the TZ env.
+        configTime(NTP_TZ_OFFSET_SEC, 0, NTP_SERVER);
+
         _myOta = new MyOta();
         // Push any OTA hooks registered before Setup().
         if (_otaStartEvent)
@@ -827,6 +884,8 @@ public:
 
     void Loop()
     {
+        SaveClockToRtc(); // snapshot time into RTC memory (no-op without LIONWIFI_RTC_CLOCK / before sync)
+
         if (!_on)
         {
 #ifndef ESP32

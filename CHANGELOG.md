@@ -3,6 +3,34 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.2.1 — 2026-08-01
+
+### Changed
+- File-browser listing (`/spiffs/ls`, `/sd/ls`) on the ESP32 async server now
+  streams the HTML through `beginChunkedResponse` instead of building the whole
+  page into one buffer. Memory use is now independent of file count (a few KB of
+  generator state instead of ~20–35 KB of contiguous heap for a large listing),
+  so the page no longer risks a failed allocation / crash on a fragmented heap.
+  The sync (ESP8266 / `NO_ASYNC_WEB_SERVER`) path already streamed via
+  `ServerStream` and is unchanged in behaviour; both share new render helpers.
+- Breadcrumb debug logs around listing (request received, file count, streaming
+  start) to aid field diagnosis.
+
+### Fixed
+- Apply the NTP timezone offset (`configTime`) immediately at boot in `Setup()`,
+  so timestamps are in local time from the first log line rather than only after
+  the first successful NTP sync.
+
+### Added
+- **ESP32 RTC clock persistence** (opt-out via `-D LIONWIFI_NO_RTC_CLOCK`;
+  on by default on ESP32). The wall clock is checkpointed to `RTC_NOINIT` slow
+  memory each loop and restored very early on boot via
+  `WifiConnector::RestoreClockFromRtc()`, so time survives a **software** reset
+  (OTA, `/restart`, crash) without waiting for NTP. Lost on true power loss (the
+  magic no longer matches → restore is skipped), which is correct. Works around
+  ESP-IDF not persisting SNTP time across a reset. The snapshot variables are
+  defined once in the new `WifiConnector.cpp` translation unit.
+
 ## 1.2.0 — 2026-07-21
 
 ### Added

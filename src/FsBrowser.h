@@ -774,7 +774,86 @@ public:
         return stats;
     }
 
+    // ---- /spiffs/ls rendering, shared by the sync ServerStream path and the async
+    //      chunked generator. Row printf keeps the format string in flash on ESP8266
+    //      (printf_P); on ESP32 PROGMEM is flat and Print has no printf_P. ---------
+#ifdef ESP32
+#define LS_ROW_PRINTF(o, fmt, ...) (o).printf(fmt, ##__VA_ARGS__)
+#else
+#define LS_ROW_PRINTF(o, fmt, ...) (o).printf_P(PSTR(fmt), ##__VA_ARGS__)
+#endif
+
+    void renderLsHead(Print &out)
+    {
+        out.print(F("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Files</title>"));
+#ifndef NO_FS_BROWSER_CSS
+        out.print(F("<style>" FS_BROWSER_CSS "</style>"));
+#endif
+        out.print(F("</head><body><div class=\"fs-wrap\">"
+                    "<form class=\"fs-upload\" method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"><input class=\"fs-btn\" type=\"submit\" value=\"Upload\"></form>"
+                    "<table class=\"fs-table\"><thead><tr><th class=\"name\">Name</th><th class=\"size\">Size</th>"));
+#ifdef USE_FILE_TIME
+        out.print(F("<th class=\"time\">Created</th><th class=\"time\">Modified</th>"));
+#endif
+        out.print(F("<th class=\"actions\">Action</th></tr></thead><tbody>\n"));
+    }
+
+    void renderLsRow(Print &out, DirEntry &entry, bool sd)
+    {
+        // href targets are percent-encoded; visible text / confirm() prompt stay raw.
+        String enc = UrlEncode(entry.fullName);
+        if (entry.isFolder) // subfolders listed but not navigable (flat listing)
+            LS_ROW_PRINTF(out, "<tr class=\"dir\"><td class=\"name\">%s</td><td class=\"size\">DIR</td>", entry.fullName);
+        else
+            LS_ROW_PRINTF(out, "<tr><td class=\"name\"><a class=\"fs-link\" href=\"%s\">%s</a></td><td class=\"size\">%s</td>",
+                          enc.c_str(), entry.fullName, FileSize(entry.size).c_str());
+#ifdef USE_FILE_TIME
+        LS_ROW_PRINTF(out, "<td class=\"time\">%s</td><td class=\"time\">%s</td>",
+                      FileTime(entry.creationTime).c_str(), FileTime(entry.writeTime).c_str());
+#endif
+        if (entry.isFolder)
+            out.print(F("<td class=\"actions\"></td></tr>\n"));
+        else
+        {
+            if (sd)
+                LS_ROW_PRINTF(out, "<td class=\"actions\"><a class=\"act\" href=\"/sd/tail/%s\">Tail</a><a class=\"act\" href=\"/sd/download/%s\">Download</a><a class=\"act act-del\" href=\"/sd/del/%s\"",
+                              enc.c_str(), enc.c_str(), enc.c_str());
+            else
+                LS_ROW_PRINTF(out, "<td class=\"actions\"><a class=\"act\" href=\"/tail/%s\">Tail</a><a class=\"act\" href=\"/download/%s\">Download</a><a class=\"act act-del\" href=\"/del/%s\"",
+                              enc.c_str(), enc.c_str(), enc.c_str());
+            LS_ROW_PRINTF(out, " onclick=\"return confirm('Are you sure to delete %s?')\">Delete</a></td></tr>\n", entry.fullName);
+        }
+    }
+
+    void renderLsFoot(Print &out, const FileSystemStats &stats)
+    {
+        out.print(F("</tbody><tfoot>"));
+#ifdef USE_FILE_TIME
+        LS_ROW_PRINTF(out, "<tr class=\"fs-summary\"><td class=\"name\">Total</td><td class=\"size\">%s</td><td colspan=\"3\"></td></tr>"
+                      "<tr class=\"fs-summary\"><td class=\"name\">Free</td><td class=\"size\">%s</td><td colspan=\"3\"></td></tr>",
+                      FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
+#else
+        LS_ROW_PRINTF(out, "<tr class=\"fs-summary\"><td class=\"name\">Total</td><td class=\"size\">%s</td><td></td></tr>"
+                      "<tr class=\"fs-summary\"><td class=\"name\">Free</td><td class=\"size\">%s</td><td></td></tr>",
+                      FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
+#endif
+        out.print(F("</tfoot></table><a class=\"fs-home\" href=\"/\">Home</a></div></body></html>"));
+    }
+
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+    // Streaming state for the async chunked LS response — lives in a shared_ptr
+    // captured by the filler; freed when the stream completes OR the client aborts.
+    struct LsState
+    {
+        Array<DirEntry> files;
+        FileSystemStats stats;
+        bool sd = false;
+        int phase = 0; // 0 head, 1 rows, 2 foot, 3 done
+        int row = 0;
+        String pending;   // current not-yet-fully-sent fragment
+        size_t pos = 0;   // bytes of `pending` already copied out
+    };
+
     void HandleLs(AsyncWebServerRequest *request, bool sd)
     {
         Logger.Log_P(ILogger::LvlDebug, PSTR("Got LS request, SD = %d, free mem = %ld"), (int)sd,  esp_get_free_heap_size());
@@ -792,101 +871,74 @@ public:
         if (!DoAuth())
             return;
 #endif
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+        // Async: TRUE chunked stream. The page is generated on demand inside the
+        // filler, so only one fragment (a row / the head) is buffered at a time —
+        // peak memory is independent of file count. (Buffering the whole page in a
+        // String/AsyncResponseStream needs one large contiguous block that OOM-panics
+        // on a fragmented heap once the listing grows.) State (sorted list + render
+        // position) lives in a shared_ptr captured by the filler; it is freed when the
+        // stream finishes OR the client aborts — same pattern as SendFileResponse.
+        auto st = std::make_shared<LsState>();
+        st->sd = sd;
+        if (sd)
+            ListSdFiles(st->files);
+        else
+            ListSpiffsFiles(st->files);
+        qsort(st->files.GetData(), st->files.Length(), sizeof(DirEntry), DirEntrySort);
+        st->stats = GetFsStats(sd);
+        Logger.Log_P(ILogger::LvlDebug, PSTR("LS: streaming %d files"), st->files.Length());
+
+        FsBrowser *self = this;
+        request->send(request->beginChunkedResponse("text/html; charset=utf-8",
+            [self, st](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
+            {
+                (void)index;
+                size_t written = 0;
+                while (written < maxLen)
+                {
+                    if (st->pos >= st->pending.length()) // current fragment drained → make the next
+                    {
+                        st->pending = String();
+                        st->pos = 0;
+                        StringStream ss(st->pending);
+                        if (st->phase == 0) { self->renderLsHead(ss); st->phase = 1; }
+                        else if (st->phase == 1)
+                        {
+                            if (st->row < st->files.Length()) { self->renderLsRow(ss, st->files[st->row], st->sd); st->row++; }
+                            else st->phase = 2;
+                        }
+                        else if (st->phase == 2) { self->renderLsFoot(ss, st->stats); st->phase = 3; }
+                        else break; // phase 3: whole page emitted
+                        rtc_wdt_feed();
+                        if (st->pending.length() == 0) continue;
+                    }
+                    size_t avail = st->pending.length() - st->pos;
+                    size_t n = avail < (maxLen - written) ? avail : (maxLen - written);
+                    memcpy(buffer + written, st->pending.c_str() + st->pos, n);
+                    written += n;
+                    st->pos += n;
+                }
+                return written; // 0 → done, ends the stream
+            }));
+#else
         Array<DirEntry> files;
         if (sd)
             ListSdFiles(files); // SD listing is flat (root only)
         else
             ListSpiffsFiles(files);
-
         qsort(files.GetData(), files.Length(), sizeof(DirEntry), DirEntrySort);
 
-        // Output sink: on the sync server stream the page in ~1 KB chunks via
-        // ServerStream (never holding the whole page); on the async server (no
-        // streaming Print) build one String, reserved up-front to limit realloc
-        // churn. Both are Print, so the row-building code below is shared.
-#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-        String buffer;
-        // head + built-in <style> (~1.5 KB) + one row per file (~230 B/row).
-        buffer.reserve(2048 + (size_t)files.Length() * 230);
-        StringStream out(buffer);
-        rtc_wdt_feed();
-#else
-        // Canonical chunked-response start: CONTENT_LENGTH_UNKNOWN makes
-        // _prepareHeader() emit "Transfer-Encoding: chunked", and send() with an
-        // empty String writes ONLY the headers (it sends a body just `if
-        // (content.length())`). ServerStream then streams the chunks; the
-        // terminating "0\r\n\r\n" is written at the end (sendContent("") /
-        // chunkedResponseFinalize()).
-        // NB: must be send(), NOT send_P(..., PSTR("")) — send_P() unconditionally
-        // forwards to sendContent_P(), which on ESP32 emits the terminating chunk
-        // for an empty body and closes the stream (→ blank page).
+        // Sync chunked-response start: CONTENT_LENGTH_UNKNOWN → "Transfer-Encoding:
+        // chunked"; send() with an empty String writes only headers. ServerStream then
+        // streams the chunks; terminated at the end. (send(), NOT send_P("").)
         _server.setContentLength(CONTENT_LENGTH_UNKNOWN);
         _server.send(200, __text_html__F, "");
         ServerStream out(_server);
-#endif
-        out.print(F("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Files</title>"));
-#ifndef NO_FS_BROWSER_CSS
-        out.print(F("<style>" FS_BROWSER_CSS "</style>"));
-#endif
-        out.print(F("</head><body><div class=\"fs-wrap\">"
-                    "<form class=\"fs-upload\" method=\"post\" enctype=\"multipart/form-data\"><input type=\"file\" name=\"name\"><input class=\"fs-btn\" type=\"submit\" value=\"Upload\"></form>"
-                    "<table class=\"fs-table\"><thead><tr><th class=\"name\">Name</th><th class=\"size\">Size</th>"));
-#ifdef USE_FILE_TIME
-        out.print(F("<th class=\"time\">Created</th><th class=\"time\">Modified</th>"));
-#endif
-        out.print(F("<th class=\"actions\">Action</th></tr></thead><tbody>\n"));
-
+        renderLsHead(out);
         for (int i = 0; i < files.Length(); i++)
-        {
-            DirEntry entry = files[i];
-            // href targets must be percent-encoded (spaces / UTF-8 / reserved
-            // chars); the visible link text and the confirm() prompt stay raw.
-            String enc = UrlEncode(entry.fullName);
-
-            if (entry.isFolder) // subfolders are listed but not navigable (flat listing)
-                out.printf_P(PSTR("<tr class=\"dir\"><td class=\"name\">%s</td><td class=\"size\">DIR</td>"),
-                             entry.fullName);
-            else
-                out.printf_P(PSTR("<tr><td class=\"name\"><a class=\"fs-link\" href=\"%s\">%s</a></td><td class=\"size\">%s</td>"),
-                             enc.c_str(), entry.fullName, FileSize(entry.size).c_str());
-#ifdef USE_FILE_TIME
-            out.printf_P(PSTR("<td class=\"time\">%s</td><td class=\"time\">%s</td>"),
-                         FileTime(entry.creationTime).c_str(), FileTime(entry.writeTime).c_str());
-#endif
-            if (entry.isFolder)
-                out.print(F("<td class=\"actions\"></td></tr>\n"));
-            else
-            {
-                if (sd)
-                    out.printf_P(PSTR("<td class=\"actions\"><a class=\"act\" href=\"/sd/tail/%s\">Tail</a><a class=\"act\" href=\"/sd/download/%s\">Download</a><a class=\"act act-del\" href=\"/sd/del/%s\""),
-                                 enc.c_str(), enc.c_str(), enc.c_str());
-                else
-                    out.printf_P(PSTR("<td class=\"actions\"><a class=\"act\" href=\"/tail/%s\">Tail</a><a class=\"act\" href=\"/download/%s\">Download</a><a class=\"act act-del\" href=\"/del/%s\""),
-                                 enc.c_str(), enc.c_str(), enc.c_str());
-                out.printf_P(PSTR(" onclick=\"return confirm('Are you sure to delete %s?')\">Delete</a></td></tr>\n"), entry.fullName);
-            }
-#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-            rtc_wdt_feed();
-#endif
-        }
-
-        FileSystemStats stats = GetFsStats(sd);
-        out.print(F("</tbody><tfoot>"));
-#ifdef USE_FILE_TIME
-        out.printf_P(PSTR("<tr class=\"fs-summary\"><td class=\"name\">Total</td><td class=\"size\">%s</td><td colspan=\"3\"></td></tr>"
-                          "<tr class=\"fs-summary\"><td class=\"name\">Free</td><td class=\"size\">%s</td><td colspan=\"3\"></td></tr>"),
-                     FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
-#else
-        out.printf_P(PSTR("<tr class=\"fs-summary\"><td class=\"name\">Total</td><td class=\"size\">%s</td><td></td></tr>"
-                          "<tr class=\"fs-summary\"><td class=\"name\">Free</td><td class=\"size\">%s</td><td></td></tr>"),
-                     FileSize(stats.totalSize).c_str(), FileSize(stats.freeSize).c_str());
-#endif
-        out.print(F("</tfoot></table><a class=\"fs-home\" href=\"/\">Home</a></div></body></html>"));
-
-#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-        request->send(200, __text_html__F, buffer);
-        Logger.Log_P(ILogger::LvlDebug, PSTR("Fully sent LS content, free mem = %ld"), esp_get_free_heap_size());
-#else
+            renderLsRow(out, files[i], sd);
+        renderLsFoot(out, GetFsStats(sd));
         out.flush(); // emit the final partial chunk
 #ifdef ESP32
         _server.sendContent(""); // ESP32 WebServer: terminate the chunked response
