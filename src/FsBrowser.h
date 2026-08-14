@@ -496,21 +496,30 @@ public:
             uint32_t pos = fsize > TailSize ? fsize - TailSize : 0;
             if (pos)
                 dataFile.seek(pos);
-            char *buf = new char[TailSize + 1];
-            if (!buf)
+            // Стримим хвост маленькими чанками с ПРАВИЛЬНЫМ Content-Length — без
+            // большого буфера. Раньше читали весь хвост (до 8 КБ) в char[] и отдавали
+            // send(200,type,buf), где buf копировался ещё и в String: на фрагментированной
+            // куче ESP8266 аллокация падала → тело пустое (Content-Length 0), хотя лог
+            // печатал read=TailSize. (streamFile() тоже нельзя — он ставит полный размер файла.)
+            size_t tailLen = fsize - pos;
+            _server.setContentLength(tailLen);
+            _server.send(200, GetContentType(name), emptyString);
+            uint8_t chunk[512];
+            size_t sent = 0;
+            while (sent < tailLen)
             {
-                dataFile.close();
-                Logger.UnlockFsSemaphore();
-                _server.send(500, __text_plain__F, F("500: out of memory"));
-                return false;
+                size_t want = tailLen - sent;
+                if (want > sizeof(chunk))
+                    want = sizeof(chunk);
+                int n = dataFile.read(chunk, want);
+                if (n <= 0)
+                    break;
+                _server.sendContent((const char *)chunk, (size_t)n);
+                sent += n;
             }
-            size_t read = dataFile.readBytes(buf, TailSize);
             dataFile.close();
-            buf[read] = 0;
-            _server.send(200, GetContentType(name), buf); // Content-Length = bytes sent
-            delete[] buf;
             Logger.UnlockFsSemaphore();
-            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)read);
+            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)sent);
             return true;
         }
         size_t sent = _server.streamFile(dataFile, GetContentType(name));

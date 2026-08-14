@@ -3,6 +3,17 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.2.2 — 2026-08-13
+
+### Fixed
+- `/tail/<f>` and `/log/tail` on the sync server (ESP8266) returned an **empty
+  body** for large files. The tail (up to `TailSize`, 8 KB) was read into a
+  `char[]` and passed to `send(200, type, buf)`, which copied it into a `String`
+  — a second large allocation that fails on a fragmented ESP8266 heap, so the
+  response body was 0-length (while the debug log still printed the intended byte
+  count). Now the tail is streamed in 512-byte chunks with a correct
+  `Content-Length` and no large buffer at all.
+
 ## 1.2.1 — 2026-08-01
 
 ### Changed
