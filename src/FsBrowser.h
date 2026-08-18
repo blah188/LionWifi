@@ -4,7 +4,8 @@
 // FsBrowser — minimal web filesystem browser for LionWifi (SPIFFS / LittleFS /
 // optional SD). Registers routes on the consumer's web server (ESP8266WebServer,
 // or ESP32 WebServer / ESPAsyncWebServer): directory listing with upload, file
-// tail/download/delete, log views and a format route. HTTP Basic auth optional.
+// tail/download/rename/delete, log views and a format route. HTTP Basic auth
+// optional.
 //
 // Select a filesystem with -D USE_SPIFFS or -D LFS; enable SD with -D USE_SD_CARD
 // (and -D SDFAT for SdFat). Uses the global `Logger` (LionLogger) for the FS
@@ -533,6 +534,52 @@ public:
     }
 #endif
 
+    // Rename a file (used by /ren/<name>?to=<newname> and /sd/ren/...). The
+    // target gets a leading '/' if missing; an existing target is NOT
+    // overwritten (rename refused). Internal FS access goes under the Logger's
+    // FS semaphore, same as delete.
+    // Returns nullptr on success, or a short flash-string reason for the
+    // refusal — the route handler turns it into a 409 body.
+    const __FlashStringHelper *RenameFile(const String &from, String to, bool sd)
+    {
+        if (!to.length())
+            return F("missing ?to=<new name>");
+        if (to[0] != '/')
+            to = "/" + to;
+        const __FlashStringHelper *err = nullptr;
+        if (!sd)
+        {
+            if (!Logger.TryLockFsSemaphore())
+                return F("filesystem busy, try again");
+            if (!LIONWIFI_FS.exists(from))
+                err = F("source file not found");
+            else if (LIONWIFI_FS.exists(to))
+                err = F("target name already exists");
+            else if (!LIONWIFI_FS.rename(from, to))
+                err = F("rename failed");
+            Logger.UnlockFsSemaphore();
+        }
+#ifdef USE_SD_CARD
+        else
+        {
+            String f = (from.length() && from[0] == '/') ? from : String('/') + from;
+            if (!SD.exists(f.c_str()))
+                err = F("source file not found");
+            else if (SD.exists(to.c_str()))
+                err = F("target name already exists");
+            else if (!SD.rename(f.c_str(), to.c_str()))
+                err = F("rename failed");
+        }
+#endif
+        if (err) // the detailed reason goes into the HTTP response
+            Logger.Log_P(ILogger::LvlWarning, PSTR("Rename %s -> %s (%s) refused"),
+                         from.c_str(), to.c_str(), sd ? "SD" : LIONWIFI_FS_NAME);
+        else
+            Logger.Log_P(ILogger::LvlInfo, PSTR("Rename %s -> %s (%s) OK"),
+                         from.c_str(), to.c_str(), sd ? "SD" : LIONWIFI_FS_NAME);
+        return err;
+    }
+
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     bool HandleFileRead(String path, AsyncWebServerRequest *request, bool auth = true) // send the right file to the client (if it exists)
     {
@@ -571,7 +618,53 @@ public:
             return true;
         }
 
+        if (path.startsWith("/ren"))
+        {
+            String name = path.substring(4); // "/ren/foo" -> "/foo"
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+            String to = request->hasParam("to") ? request->getParam("to")->value() : emptyString;
+            const __FlashStringHelper *err = RenameFile(name, to, false);
+            if (err)
+                request->send(409, __text_plain__F, String(F("Rename failed: ")) + err);
+            else
+                request->redirect(F("/spiffs/ls"));
+#else
+            const __FlashStringHelper *err = RenameFile(name, _server.arg(F("to")), false);
+            if (err)
+                _server.send(409, __text_plain__F, String(F("Rename failed: ")) + err);
+            else
+            {
+                _server.sendHeader(F("Location"), F("/spiffs/ls"));
+                _server.send(303);
+            }
+#endif
+            return true;
+        }
+
 #ifdef USE_SD_CARD
+        if (path.startsWith("/sd/ren/"))
+        {
+            String name = path.substring(7); // "/sd/ren/foo" -> "/foo"
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+            String to = request->hasParam("to") ? request->getParam("to")->value() : emptyString;
+            const __FlashStringHelper *err = RenameFile(name, to, true);
+            if (err)
+                request->send(409, __text_plain__F, String(F("Rename failed: ")) + err);
+            else
+                request->redirect(F("/sd/ls"));
+#else
+            const __FlashStringHelper *err = RenameFile(name, _server.arg(F("to")), true);
+            if (err)
+                _server.send(409, __text_plain__F, String(F("Rename failed: ")) + err);
+            else
+            {
+                _server.sendHeader(F("Location"), F("/sd/ls"));
+                _server.send(303);
+            }
+#endif
+            return true;
+        }
+
         if (path.startsWith("/sd/del/"))
         {
             String name = path.substring(8);
@@ -825,11 +918,15 @@ public:
         else
         {
             if (sd)
-                LS_ROW_PRINTF(out, "<td class=\"actions\"><a class=\"act\" href=\"/sd/tail/%s\">Tail</a><a class=\"act\" href=\"/sd/download/%s\">Download</a><a class=\"act act-del\" href=\"/sd/del/%s\"",
-                              enc.c_str(), enc.c_str(), enc.c_str());
+                LS_ROW_PRINTF(out, "<td class=\"actions\"><a class=\"act\" href=\"/sd/tail/%s\">Tail</a><a class=\"act\" href=\"/sd/download/%s\">Download</a>"
+                                   "<a class=\"act\" href=\"#\" onclick=\"var n=prompt('Rename %s to:','%s');if(n)location='/sd/ren/%s?to='+encodeURIComponent(n);return false\">Ren</a>"
+                                   "<a class=\"act act-del\" href=\"/sd/del/%s\"",
+                              enc.c_str(), enc.c_str(), entry.fullName, entry.fullName, enc.c_str(), enc.c_str());
             else
-                LS_ROW_PRINTF(out, "<td class=\"actions\"><a class=\"act\" href=\"/tail/%s\">Tail</a><a class=\"act\" href=\"/download/%s\">Download</a><a class=\"act act-del\" href=\"/del/%s\"",
-                              enc.c_str(), enc.c_str(), enc.c_str());
+                LS_ROW_PRINTF(out, "<td class=\"actions\"><a class=\"act\" href=\"/tail/%s\">Tail</a><a class=\"act\" href=\"/download/%s\">Download</a>"
+                                   "<a class=\"act\" href=\"#\" onclick=\"var n=prompt('Rename %s to:','%s');if(n)location='/ren/%s?to='+encodeURIComponent(n);return false\">Ren</a>"
+                                   "<a class=\"act act-del\" href=\"/del/%s\"",
+                              enc.c_str(), enc.c_str(), entry.fullName, entry.fullName, enc.c_str(), enc.c_str());
             LS_ROW_PRINTF(out, " onclick=\"return confirm('Are you sure to delete %s?')\">Delete</a></td></tr>\n", entry.fullName);
         }
     }

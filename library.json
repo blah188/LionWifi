@@ -1,7 +1,7 @@
 {
   "name": "LionWifi",
-  "version": "1.2.2",
-  "description": "WiFi connection manager + ArduinoOTA + web filesystem browser + status page for ESP8266 and ESP32. Multi-SSID connect with auto-reconnect and AP rotation, optional router-ping reboot watchdog, NTP time, log rotation, OTA, and a SPIFFS/LittleFS/SD browser (list/upload/download/tail/delete) served over ESP8266WebServer or (ESP32) ESPAsyncWebServer/WebServer. The consumer defines three globals (the LionLogger Logger, the web server, and WifiConnector *_connector) and selects a filesystem with -D USE_SPIFFS or -D LFS. Single-instance, non-copyable. The ESP32 async web path also needs ESPAsyncWebServer + AsyncTCP.",
+  "version": "1.3.0",
+  "description": "WiFi connection manager + ArduinoOTA + web filesystem browser + status page for ESP8266 and ESP32. Multi-SSID connect with auto-reconnect and AP rotation, optional router-ping reboot watchdog, NTP time, log rotation, OTA, and a SPIFFS/LittleFS/SD browser (list/upload/download/tail/rename/delete) served over ESP8266WebServer or (ESP32) ESPAsyncWebServer/WebServer. The consumer defines three globals (the LionLogger Logger, the web server, and WifiConnector *_connector) and selects a filesystem with -D USE_SPIFFS or -D LFS. Single-instance, non-copyable. The ESP32 async web path also needs ESPAsyncWebServer + AsyncTCP.",
   "keywords": "wifi, ota, webserver, spiffs, littlefs, filesystem, browser, ntp, esp8266, esp32, arduino",
   "repository": {
     "type": "git",

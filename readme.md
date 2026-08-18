@@ -205,11 +205,13 @@ Copy-paste examples for all three (as `#define`s or `build_flags`) are in
 ## HTTP endpoints
 
 `/` (home) · `/spiffs/ls` (list + upload) · `/tail/<f>` · `/download/<f>` ·
-`/spiffs/<f>` · `/del<f>` · `/log`, `/log/tail`, `/spiffs/log[/tail]`
+`/spiffs/<f>` · `/ren/<f>?to=<new>` (refuses to overwrite an existing target) ·
+`/del<f>` · `/log`, `/log/tail`, `/spiffs/log[/tail]`
 (LionLogger's current-day log) · `/restart` · `/format` (ESP8266 / ESP32-sync) ·
 `/update` (firmware upload, with `LIONWIFI_HTTP_OTA`) ·
 `/logout` · `/favicon.ico` · `/lion-tasks` (ESP8266). With `USE_SD_CARD`:
-`/sd/ls`, `/sd/tail/<f>`, `/sd/download/<f>`, `/sd/del/<f>` (flat — no subfolders).
+`/sd/ls`, `/sd/tail/<f>`, `/sd/download/<f>`, `/sd/ren/<f>?to=<new>`,
+`/sd/del/<f>` (flat — no subfolders).
 
 ## SD cards
 

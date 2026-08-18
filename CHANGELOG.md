@@ -3,6 +3,17 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.3.0 — 2026-08-18
+
+### Added
+- **File rename** in the FS browser: a `Ren` action in the listing (JS prompt
+  for the new name) backed by `/ren/<f>?to=<new>` (internal FS) and
+  `/sd/ren/<f>?to=<new>` (SD). The target gets a leading `/` if missing; an
+  existing target is never overwritten — the refusal comes back as a **409
+  with the reason** (target exists / source missing / FS busy). Internal-FS
+  renames go under the Logger FS semaphore, like delete. Works on both server
+  flavors (sync ESP8266 / ESP32 `NO_ASYNC_WEB_SERVER`, and ESP32 async).
+
 ## 1.2.2 — 2026-08-13
 
 ### Fixed
