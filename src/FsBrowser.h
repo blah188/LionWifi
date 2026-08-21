@@ -580,6 +580,114 @@ public:
         return err;
     }
 
+    // Copy a file (used by /cp/<name>?to=<newname> and /sd/cp/...). Same contract
+    // as RenameFile: leading '/' added to the target, an existing target is NOT
+    // overwritten, internal FS access goes under the Logger's FS semaphore.
+    // Copies in 512-byte chunks; on a failed/short write the partial target is
+    // removed. Returns nullptr on success or a flash-string refusal reason (409).
+    // The copy is SYNCHRONOUS in the web handler, so big files are refused
+    // (LIONWIFI_FS_COPY_MAX, override with -D): a multi-second flash write would
+    // stall the web task past its watchdog. The loop still yields every ~8KB as
+    // a safety net.
+#ifndef LIONWIFI_FS_COPY_MAX
+#define LIONWIFI_FS_COPY_MAX (64UL * 1024)
+#endif
+    const __FlashStringHelper *CopyFile(const String &from, String to, bool sd)
+    {
+        if (!to.length())
+            return F("missing ?to=<new name>");
+        if (to[0] != '/')
+            to = "/" + to;
+        const __FlashStringHelper *err = nullptr;
+        if (!sd)
+        {
+            if (!Logger.TryLockFsSemaphore())
+                return F("filesystem busy, try again");
+            if (!LIONWIFI_FS.exists(from))
+                err = F("source file not found");
+            else if (LIONWIFI_FS.exists(to))
+                err = F("target name already exists");
+            else
+            {
+                File src = LIONWIFI_FS.open(from, "r");
+                File dst = LIONWIFI_FS.open(to, "w");
+                if (!src || !dst)
+                    err = F("open failed");
+                else if (src.size() > LIONWIFI_FS_COPY_MAX)
+                    err = F("file too big to copy");
+                else
+                {
+                    uint8_t buf[512];
+                    uint16_t chunks = 0;
+                    while (!err)
+                    {
+                        size_t got = src.read(buf, sizeof(buf));
+                        if (!got)
+                            break;
+                        if (dst.write(buf, got) != got)
+                            err = F("write failed (FS full?)");
+                        else if ((++chunks & 0x0F) == 0)
+                            delay(1); // покормить вотчдог / уступить задачам
+                    }
+                }
+                if (src)
+                    src.close();
+                if (dst)
+                    dst.close();
+                if (err)
+                    LIONWIFI_FS.remove(to); // не оставлять огрызок
+            }
+            Logger.UnlockFsSemaphore();
+        }
+#ifdef USE_SD_CARD
+        else
+        {
+            String f = (from.length() && from[0] == '/') ? from : String('/') + from;
+            if (!SD.exists(f.c_str()))
+                err = F("source file not found");
+            else if (SD.exists(to.c_str()))
+                err = F("target name already exists");
+            else
+            {
+                MySdFile src = SD.open(f.c_str(), SD_FILE_READ);
+                MySdFile dst = SD.open(to.c_str(), SD_FILE_WRITE);
+                if (!src || !dst)
+                    err = F("open failed");
+                else if (src.size() > LIONWIFI_FS_COPY_MAX)
+                    err = F("file too big to copy");
+                else
+                {
+                    uint8_t buf[512];
+                    uint16_t chunks = 0;
+                    while (!err)
+                    {
+                        size_t got = src.read(buf, sizeof(buf));
+                        if (!got)
+                            break;
+                        if (dst.write(buf, got) != got)
+                            err = F("write failed (card full?)");
+                        else if ((++chunks & 0x0F) == 0)
+                            delay(1); // покормить вотчдог / уступить задачам
+                    }
+                }
+                if (src)
+                    src.close();
+                if (dst)
+                    dst.close();
+                if (err)
+                    SD.remove(to.c_str());
+            }
+        }
+#endif
+        if (err)
+            Logger.Log_P(ILogger::LvlWarning, PSTR("Copy %s -> %s (%s) refused"),
+                         from.c_str(), to.c_str(), sd ? "SD" : LIONWIFI_FS_NAME);
+        else
+            Logger.Log_P(ILogger::LvlInfo, PSTR("Copy %s -> %s (%s) OK"),
+                         from.c_str(), to.c_str(), sd ? "SD" : LIONWIFI_FS_NAME);
+        return err;
+    }
+
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     bool HandleFileRead(String path, AsyncWebServerRequest *request, bool auth = true) // send the right file to the client (if it exists)
     {
@@ -641,7 +749,53 @@ public:
             return true;
         }
 
+        if (path.startsWith("/cp/"))
+        {
+            String name = path.substring(3); // "/cp/foo" -> "/foo"
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+            String to = request->hasParam("to") ? request->getParam("to")->value() : emptyString;
+            const __FlashStringHelper *err = CopyFile(name, to, false);
+            if (err)
+                request->send(409, __text_plain__F, String(F("Copy failed: ")) + err);
+            else
+                request->redirect(F("/spiffs/ls"));
+#else
+            const __FlashStringHelper *err = CopyFile(name, _server.arg(F("to")), false);
+            if (err)
+                _server.send(409, __text_plain__F, String(F("Copy failed: ")) + err);
+            else
+            {
+                _server.sendHeader(F("Location"), F("/spiffs/ls"));
+                _server.send(303);
+            }
+#endif
+            return true;
+        }
+
 #ifdef USE_SD_CARD
+        if (path.startsWith("/sd/cp/"))
+        {
+            String name = path.substring(6); // "/sd/cp/foo" -> "/foo"
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+            String to = request->hasParam("to") ? request->getParam("to")->value() : emptyString;
+            const __FlashStringHelper *err = CopyFile(name, to, true);
+            if (err)
+                request->send(409, __text_plain__F, String(F("Copy failed: ")) + err);
+            else
+                request->redirect(F("/sd/ls"));
+#else
+            const __FlashStringHelper *err = CopyFile(name, _server.arg(F("to")), true);
+            if (err)
+                _server.send(409, __text_plain__F, String(F("Copy failed: ")) + err);
+            else
+            {
+                _server.sendHeader(F("Location"), F("/sd/ls"));
+                _server.send(303);
+            }
+#endif
+            return true;
+        }
+
         if (path.startsWith("/sd/ren/"))
         {
             String name = path.substring(7); // "/sd/ren/foo" -> "/foo"
@@ -920,13 +1074,15 @@ public:
             if (sd)
                 LS_ROW_PRINTF(out, "<td class=\"actions\"><a class=\"act\" href=\"/sd/tail/%s\">Tail</a><a class=\"act\" href=\"/sd/download/%s\">Download</a>"
                                    "<a class=\"act\" href=\"#\" onclick=\"var n=prompt('Rename %s to:','%s');if(n)location='/sd/ren/%s?to='+encodeURIComponent(n);return false\">Ren</a>"
+                                   "<a class=\"act\" href=\"#\" onclick=\"var n=prompt('Copy %s to:','%s');if(n)location='/sd/cp/%s?to='+encodeURIComponent(n);return false\">Cp</a>"
                                    "<a class=\"act act-del\" href=\"/sd/del/%s\"",
-                              enc.c_str(), enc.c_str(), entry.fullName, entry.fullName, enc.c_str(), enc.c_str());
+                              enc.c_str(), enc.c_str(), entry.fullName, entry.fullName, enc.c_str(), entry.fullName, entry.fullName, enc.c_str(), enc.c_str());
             else
                 LS_ROW_PRINTF(out, "<td class=\"actions\"><a class=\"act\" href=\"/tail/%s\">Tail</a><a class=\"act\" href=\"/download/%s\">Download</a>"
                                    "<a class=\"act\" href=\"#\" onclick=\"var n=prompt('Rename %s to:','%s');if(n)location='/ren/%s?to='+encodeURIComponent(n);return false\">Ren</a>"
+                                   "<a class=\"act\" href=\"#\" onclick=\"var n=prompt('Copy %s to:','%s');if(n)location='/cp/%s?to='+encodeURIComponent(n);return false\">Cp</a>"
                                    "<a class=\"act act-del\" href=\"/del/%s\"",
-                              enc.c_str(), enc.c_str(), entry.fullName, entry.fullName, enc.c_str(), enc.c_str());
+                              enc.c_str(), enc.c_str(), entry.fullName, entry.fullName, enc.c_str(), entry.fullName, entry.fullName, enc.c_str(), enc.c_str());
             LS_ROW_PRINTF(out, " onclick=\"return confirm('Are you sure to delete %s?')\">Delete</a></td></tr>\n", entry.fullName);
         }
     }

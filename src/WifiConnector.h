@@ -659,8 +659,13 @@ public:
                 if (_otaEndEvent) _otaEndEvent(ok);
                 AsyncWebServerResponse *resp = request->beginResponse(200, __text_plain__F, ok ? F("Update OK - rebooting") : F("Update FAILED"));
                 resp->addHeader(F("Connection"), F("close"));
+                // send() лишь СТАВИТ ответ в очередь async-стека: ребут через delay()
+                // обрывал соединение до отправки — curl ждал ответа до своего таймаута.
+                // Ребутимся по onDisconnect: Connection:close закрывает соединение
+                // сервером сразу после доставки ответа клиенту.
+                if (ok)
+                    request->onDisconnect([]() { ESP.restart(); });
                 request->send(resp);
-                if (ok) { delay(100); ESP.restart(); }
             },
             [this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final)
             {
@@ -686,7 +691,9 @@ public:
                 if (!_httpOtaAuthOk) return;
                 if (Update.write(data, len) != len)
                     Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
-                if (_otaProgressEvent) _otaProgressEvent((unsigned int)(index + len), 0);
+                // total = длина POST-запроса: чуть больше бинарника (multipart-обвязка,
+                // <1%), но даёт честные проценты — Update.begin() шёл с SIZE_UNKNOWN.
+                if (_otaProgressEvent) _otaProgressEvent((unsigned int)(index + len), (unsigned int)request->contentLength());
                 if (final)
                 {
                     if (Update.end(true))
@@ -747,7 +754,13 @@ public:
                 {
                     if (Update.write(up.buf, up.currentSize) != up.currentSize)
                         Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
+#ifdef ESP32
+                    // total = длина POST (multipart-обвязка даёт погрешность <1%).
+                    if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, (unsigned int)server.clientContentLength());
+#else
+                    // ESP8266WebServer не отдаёт Content-Length наружу — total неизвестен.
                     if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, 0);
+#endif
                 }
                 else if (up.status == UPLOAD_FILE_END && _httpOtaAuthOk)
                 {

@@ -3,6 +3,35 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.3.1 — 2026-08-21
+
+### Added
+- **File copy** in the FS browser: a `Cp` action in the listing (JS prompt for
+  the target name) backed by `/cp/<f>?to=<new>` (internal FS) and
+  `/sd/cp/<f>?to=<new>` (SD). Same contract as rename: leading `/` added, an
+  existing target is never overwritten — refusals come back as **409 with the
+  reason**. Copies in 512-byte chunks; a failed/short write removes the partial
+  target. Internal-FS copies run under the Logger FS semaphore. Works on both
+  server flavors. The copy is synchronous in the web handler, so files over
+  `LIONWIFI_FS_COPY_MAX` (default 64KB, `-D` to override) are refused — a
+  multi-second flash write would stall the web task past its watchdog; the loop
+  additionally yields every ~8KB as a safety net.
+
+### Fixed
+- **HTTP OTA (async): the client never received the "Update OK" response** — the
+  handler rebooted 100 ms after `request->send()`, but on the async server send()
+  only queues the response, so the device died before the bytes (and TCP FIN)
+  went out; curl hung until its own timeout. The reboot now happens in the
+  request's `onDisconnect` callback: `Connection: close` makes the server close
+  the connection right after the response is delivered, then the ESP restarts.
+- **HTTP OTA progress events reported `total = 0`** (`Update.begin()` runs with
+  `UPDATE_SIZE_UNKNOWN`), so consumers computing percentages always got 0%.
+  Now `total` is the POST request length — slightly larger than the binary
+  (multipart overhead, <1%), good enough for a progress bar. Async server uses
+  `request->contentLength()`; sync server uses `clientContentLength()` on ESP32.
+  On ESP8266 (sync) the core exposes no Content-Length getter — `total` stays 0
+  there. espota progress was always correct and is unchanged.
+
 ## 1.3.0 — 2026-08-18
 
 ### Added
