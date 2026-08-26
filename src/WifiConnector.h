@@ -183,6 +183,14 @@ extern "C"
 #define PING_ROUTER_MAX_FAILURES 4
 #endif
 
+// Async responses that end in a reboot (/restart, successful /update) fire it from
+// onDisconnect, so the client actually receives the reply first. If the client never
+// closes the connection, this is how long Loop() waits before rebooting anyway —
+// otherwise a keep-alive'ing browser could park the device on the old firmware.
+#ifndef REBOOT_FALLBACK_MS
+#define REBOOT_FALLBACK_MS 5000ul
+#endif
+
 // Default web-auth credentials. These are intentionally generic placeholders —
 // OVERRIDE THEM with -D WEB_SERVER_AUTH_USER=\"...\" / -D WEB_SERVER_AUTH_PASSWORD=\"...\"
 // for any real deployment. (Auth can be disabled entirely with -D NO_AUTH.)
@@ -278,6 +286,22 @@ private:
     bool _otaStarted = false;
 #ifdef LIONWIFI_HTTP_OTA
     bool _httpOtaAuthOk = false; // latched when the upload starts; response gated on it
+#endif
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+    // Deadline for the fallback reboot; 0 = none pending. See scheduleReboot().
+    uint32_t _rebootAt = 0;
+    const char *_rebootWhy = nullptr;
+
+    // A reboot that must not cut the response short. onDisconnect() reboots as soon as
+    // the client is gone; this deadline covers the case where it never disconnects.
+    // Both paths land on ESP.restart(), whichever comes first.
+    void scheduleReboot(const char *why)
+    {
+        _rebootWhy = why;
+        _rebootAt = millis() + REBOOT_FALLBACK_MS;
+        if (!_rebootAt)
+            _rebootAt = 1; // millis() wrapped exactly onto 0 — keep "pending" truthy
+    }
 #endif
 
 public:
@@ -664,7 +688,12 @@ public:
                 // Ребутимся по onDisconnect: Connection:close закрывает соединение
                 // сервером сразу после доставки ответа клиенту.
                 if (ok)
+                {
                     request->onDisconnect([]() { ESP.restart(); });
+                    // ...и не ждать закрытия вечно: клиент, держащий соединение, иначе
+                    // оставил бы устройство работать на СТАРОЙ прошивке неограниченно.
+                    scheduleReboot(PSTR("HTTP OTA"));
+                }
                 request->send(resp);
             },
             [this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final)
@@ -833,9 +862,16 @@ public:
         server.on("/restart", HTTP_GET, [this](AsyncWebServerRequest *request)
                   {
             if (!_fsBrowser->DoAuth(request)) return;
-            request->send(200, __text_plain__F, F("Restarting..."));
-            delay(100);
-            ESP.restart(); });
+            // send() only QUEUES the response on the async stack: the old delay(100) +
+            // ESP.restart() tore the connection down before it was delivered, and the
+            // browser silently retried the (idempotent) GET once the device was back —
+            // one click produced two reboots. Reboot from onDisconnect instead, with
+            // Connection:close so the server hangs up right after delivery.
+            AsyncWebServerResponse *resp = request->beginResponse(200, __text_plain__F, F("Restarting..."));
+            resp->addHeader(F("Connection"), F("close"));
+            request->onDisconnect([]() { ESP.restart(); });
+            scheduleReboot(PSTR("/restart"));
+            request->send(resp); });
 #else
 #if !defined(ESP32)
             server.on(F("/lion-tasks"), [this]()
@@ -898,6 +934,17 @@ public:
     void Loop()
     {
         SaveClockToRtc(); // snapshot time into RTC memory (no-op without LIONWIFI_RTC_CLOCK / before sync)
+
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+        // Fallback for a scheduled reboot whose onDisconnect never fired (client kept
+        // the connection open). Signed compare so a millis() wrap can't defer it.
+        if (_rebootAt && (int32_t)(millis() - _rebootAt) >= 0)
+        {
+            Logger.Log_P(ILogger::LvlWarning, PSTR("Rebooting (%S): client never closed the connection"),
+                         _rebootWhy ? _rebootWhy : PSTR("?"));
+            ESP.restart();
+        }
+#endif
 
         if (!_on)
         {

@@ -3,6 +3,24 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.3.2 — 2026-08-26
+
+### Fixed
+- **`/restart` rebooted twice per click** on the async (ESP32) server. The handler
+  called `request->send()` and then `delay(100); ESP.restart()`, but `send()` only
+  *queues* the response on the async stack — the reset tore the connection down
+  before delivery, and the browser silently retried the (idempotent) GET as soon as
+  the device was back, triggering a second reboot. Now the response carries
+  `Connection: close` and the reboot fires from `onDisconnect()`, matching what
+  1.3.1 already did for HTTP OTA.
+
+### Added
+- **Fallback reboot deadline** (`REBOOT_FALLBACK_MS`, default 5000 ms) for both
+  reboot-after-response paths (`/restart` and a successful `/update`). If the client
+  never closes the connection, `onDisconnect()` never fires — previously that left
+  the device running indefinitely, in the OTA case on the *old* firmware. `Loop()`
+  now reboots once the deadline passes and logs why.
+
 ## 1.3.1 — 2026-08-21
 
 ### Added
