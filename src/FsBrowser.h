@@ -93,6 +93,20 @@ extern const char __text_html__P[];
 extern const char __slash_favicon_ico__P[];
 #define __slash_favicon_ico__F FPSTR(__slash_favicon_ico__P)
 
+// Buffer size for streaming files out (tail/download) and for file copy (override with -D).
+// The buffer lives on the STACK of the web handler and the ESP8266 cont stack is only 4 KB:
+// 512 bytes noticeably ate the margin (free stack dropped from ~1120 to ~620 bytes while
+// serving a log tail). 128 bytes is plenty — the cost is more read/sendContent calls, not
+// memory. ESP32 tasks get a large stack, so it keeps the previous 512.
+// A static buffer is deliberately not used: it would waste that RAM permanently.
+#ifndef LIONWIFI_FS_CHUNK
+#if defined(ESP8266)
+#define LIONWIFI_FS_CHUNK 128
+#else
+#define LIONWIFI_FS_CHUNK 512
+#endif
+#endif
+
 // ---- File-listing look & feel ----------------------------------------------
 // The directory page (/spiffs/ls, /sd/ls) ships a small built-in stylesheet
 // (light + dark theme). It costs ~2.0 KB of flash (the CSS string is ~2012 B).
@@ -505,7 +519,7 @@ public:
             size_t tailLen = fsize - pos;
             _server.setContentLength(tailLen);
             _server.send(200, GetContentType(name), emptyString);
-            uint8_t chunk[512];
+            uint8_t chunk[LIONWIFI_FS_CHUNK];
             size_t sent = 0;
             while (sent < tailLen)
             {
@@ -583,12 +597,12 @@ public:
     // Copy a file (used by /cp/<name>?to=<newname> and /sd/cp/...). Same contract
     // as RenameFile: leading '/' added to the target, an existing target is NOT
     // overwritten, internal FS access goes under the Logger's FS semaphore.
-    // Copies in 512-byte chunks; on a failed/short write the partial target is
-    // removed. Returns nullptr on success or a flash-string refusal reason (409).
+    // Copies in LIONWIFI_FS_CHUNK-byte chunks; on a failed/short write the partial
+    // target is removed. Returns nullptr on success or a flash-string refusal reason (409).
     // The copy is SYNCHRONOUS in the web handler, so big files are refused
     // (LIONWIFI_FS_COPY_MAX, override with -D): a multi-second flash write would
-    // stall the web task past its watchdog. The loop still yields every ~8KB as
-    // a safety net.
+    // stall the web task past its watchdog. The loop still yields every 16 chunks
+    // as a safety net.
 #ifndef LIONWIFI_FS_COPY_MAX
 #define LIONWIFI_FS_COPY_MAX (64UL * 1024)
 #endif
@@ -617,7 +631,7 @@ public:
                     err = F("file too big to copy");
                 else
                 {
-                    uint8_t buf[512];
+                    uint8_t buf[LIONWIFI_FS_CHUNK];
                     uint16_t chunks = 0;
                     while (!err)
                     {
@@ -657,7 +671,7 @@ public:
                     err = F("file too big to copy");
                 else
                 {
-                    uint8_t buf[512];
+                    uint8_t buf[LIONWIFI_FS_CHUNK];
                     uint16_t chunks = 0;
                     while (!err)
                     {

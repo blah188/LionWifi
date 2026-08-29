@@ -3,6 +3,22 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.3.3 — 2026-08-29
+
+### Fixed
+- **Web-handler stack usage on ESP8266.** File streaming (`/tail`, download) and file
+  copy (`/cp`) read into a 512-byte buffer living on the *stack* of the web handler.
+  With only 4 KB of cont stack that was expensive: serving an 8 KB log tail pushed the
+  free-stack watermark from ~1120 down to ~620 bytes on a device that also drives
+  device I/O from the same loop. The size is now `LIONWIFI_FS_CHUNK`, defaulting to
+  **128 bytes on ESP8266** (ESP32 keeps 512 — its task stacks are large). The cost is
+  more `read`/`sendContent` calls, not memory; measured free stack goes back to ~1010 B.
+
+### Added
+- **`LIONWIFI_FS_CHUNK`** (override with `-D`): buffer size used for streaming files
+  out and for copying them. A static buffer is deliberately not used — it would spend
+  that RAM permanently, which is exactly what is scarce on ESP8266.
+
 ## 1.3.2 — 2026-08-26
 
 ### Fixed
