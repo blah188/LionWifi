@@ -334,6 +334,10 @@ public:
         if (_doAuth && !request->authenticate(_username, _password))
         {
             request->requestAuthentication();
+            // Logged like on the sync path: without this line a 401 was invisible,
+            // and the overwritten-challenge bug above read as "the file is gone".
+            Logger.Log_P(ILogger::LvlWarning, PSTR("Need auth for %s: %s"),
+                         request->client()->remoteIP().toString().c_str(), request->url().c_str());
             return false;
         }
         return true;
@@ -705,8 +709,14 @@ public:
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     bool HandleFileRead(String path, AsyncWebServerRequest *request, bool auth = true) // send the right file to the client (if it exists)
     {
+        // Return TRUE on a failed auth: DoAuth() has already queued the 401
+        // challenge, and the only caller that looks at the result is onNotFound(),
+        // which answers `false` with its own 404 — that overwrote the challenge, so
+        // the browser got a bare "404: Not Found" instead of a password prompt on
+        // every FsBrowser path without its own route (/tail, /download, /spiffs/...).
+        // "Response already sent" is exactly what true means here.
         if (auth && !DoAuth(request))
-            return false;
+            return true;
 #else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
     bool HandleFileRead(const String &path, bool auth = true) // send the right file to the client (if it exists)
     {

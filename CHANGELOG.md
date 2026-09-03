@@ -3,6 +3,25 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.3.4 — 2026-09-03
+
+### Fixed
+- **HTTP Basic auth answered `404: Not Found` instead of asking for a password** on the
+  ESP32 async server, for every FsBrowser path served through `onNotFound` — `/tail/...`,
+  `/download/...`, `/spiffs/...`, any static file. `HandleFileRead()` returned `false`
+  after `DoAuth()` had already queued the 401 challenge, and `onNotFound()` treats
+  `false` as "nothing was sent" and replied with its own 404, replacing the challenge.
+  The browser therefore never prompted, and the same URL worked as soon as credentials
+  for that realm happened to be cached — so the failure looked random, and a missing
+  file and an unauthenticated request were indistinguishable. A failed auth now returns
+  `true` ("response already sent"); the return value has no other consumer on the async
+  path. The sync (ESP8266) path was never affected: its `onNotFound` sends nothing extra.
+
+### Added
+- **The async `DoAuth()` logs the 401** (`Need auth for <ip>: <url>`), as the sync path
+  already did. Without it a 401 left no trace at all, which is what made the bug above
+  read as "the log file disappeared from the filesystem".
+
 ## 1.3.3 — 2026-08-29
 
 ### Fixed
