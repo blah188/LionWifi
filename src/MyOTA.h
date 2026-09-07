@@ -14,7 +14,14 @@
 // once WiFi is connected, then Loop() each iteration. LionWifi owns one of these.
 // =============================================================================
 
+// Define LIONWIFI_NO_ARDUINO_OTA to compile ArduinoOTA out. It is the espota (Arduino IDE /
+// PlatformIO "upload over the air") path, and calling its begin() also starts an mDNS
+// responder — together roughly 34KB of flash on ESP32. A build that flashes through the
+// HTTP OTA page (LIONWIFI_HTTP_OTA) does not need either. The class and all its hooks stay,
+// so nothing in the consumer changes: Begin()/Loop() simply become no-ops.
+#ifndef LIONWIFI_NO_ARDUINO_OTA
 #include <ArduinoOTA.h>
+#endif
 #include <Logger.h>
 #include <functional>
 
@@ -47,6 +54,7 @@ public:
 
     MyOta()
     {
+#ifndef LIONWIFI_NO_ARDUINO_OTA
         ArduinoOTA.onStart([this]()
         {
             _sketchUpload = ArduinoOTA.getCommand() == U_FLASH;
@@ -102,6 +110,7 @@ public:
             if (_onEnd)
                 _onEnd(false); // error
         });
+#endif // !LIONWIFI_NO_ARDUINO_OTA
     }
 
     // Registers ArduinoOTA callbacks capturing `this`; copying would dangle them.
@@ -111,14 +120,18 @@ public:
     // Call after WIFI connected
     void Begin()
     {
+#ifndef LIONWIFI_NO_ARDUINO_OTA
 #ifdef ESP32
         ArduinoOTA.setTimeout(40000); // must be set BEFORE begin() to take effect
 #endif
         ArduinoOTA.begin();
+#endif
     }
 
     void Loop()
     {
+#ifndef LIONWIFI_NO_ARDUINO_OTA
         ArduinoOTA.handle();
+#endif
     }
 };

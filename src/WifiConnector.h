@@ -12,10 +12,12 @@
 //
 // ---- Required globals the CONSUMER must define (this header only declares them):
 //   * MyLogger Logger(...);          // from LionLogger; .Setup() called by you
-//   * <WebServerType> server(80);    // the web server, extern'd below:
-//        ESP8266:                     ESP8266WebServer server(80);
-//        ESP32 (default, async):      AsyncWebServer   server(80);  // ESPAsyncWebServer
-//        ESP32 + NO_ASYNC_WEB_SERVER: WebServer        server(80);
+//   * WebServerType server(80);      // the web server. WebServerType is a typedef this
+//     header provides, so that line is literally portable; it resolves to
+//        ESP8266:                     ESP8266WebServer
+//        ESP32 (default, async):      AsyncWebServer            // ESPAsyncWebServer
+//        ESP32 + NO_ASYNC_WEB_SERVER: WebServer
+//     Use it in your own signatures too, and a port stops touching your code.
 //   * WifiConnector *_connector;     // extern'd at the bottom of this header
 //
 // ---- Dependencies (PlatformIO): LionArray, LionLogger, LionStreams; plus
@@ -71,6 +73,10 @@
 //   ESP32-specific:
 //   NO_WIFI_TASK             Run Loop() from your loop() instead of a FreeRTOS task.
 //   NO_ASYNC_WEB_SERVER      Use the sync WebServer instead of ESPAsyncWebServer.
+//                            Both of the above become MANDATORY when LionLogger is
+//                            built without ASYNC_LOG: each one otherwise adds a
+//                            second task that logs, and synchronous logging tolerates
+//                            exactly one. Enforced by #error further down.
 //   CORE_WIFI                FreeRTOS core for the WiFi task (default 1).
 //   DISABLE_11N              Force 802.11b/g (some APs misbehave with 11n).
 //   MAX_WIFI_POWER           Set max TX power for weak links.
@@ -136,6 +142,33 @@ extern "C"
 
 #include <FsBrowser.h> // defines LIONWIFI_FS (the selected filesystem)
 #include <MyOTA.h>      // uses LIONWIFI_FS, so it must come after FsBrowser.h
+
+// The sync web server is pumped by Loop(), and without NO_WIFI_TASK that runs in the
+// connector's own FreeRTOS task — so your route handlers execute there, concurrently with
+// loop(). That is fine for a sketch whose handlers touch nothing shared, which is why this
+// is a warning and not an #error; but it is never what a port from ESP8266 wants, where
+// every handler was written assuming a single context. (And a leftover
+// `_connector->Loop()` in loop() then pumps the same socket from two contexts at once.)
+#if defined(ESP32) && defined(NO_ASYNC_WEB_SERVER) && !defined(NO_WIFI_TASK)
+#warning "LionWifi: NO_ASYNC_WEB_SERVER without NO_WIFI_TASK - web handlers run in the connector's task, concurrently with loop(). Define NO_WIFI_TASK to keep them in loop()."
+#endif
+
+// Synchronous logging (ESP32 without ASYNC_LOG) is only valid when the entire
+// firmware logs from ONE FreeRTOS task: Log_P() then writes the file in the
+// caller's context through a shared File member, and a second logging context
+// closes that handle underneath the first (see the warning at the top of
+// Logger.h). Both configurations below add exactly such a context, and both do it
+// with LionWifi's OWN logging - reconnects, OTA progress, the file browser - so
+// "my handlers don't log" is not an escape. Both are known at compile time, hence
+// #error rather than a corrupted log file three days later.
+#if defined(ESP32) && !defined(ASYNC_LOG)
+#ifndef NO_WIFI_TASK
+#error "LionWifi: ESP32 without ASYNC_LOG requires NO_WIFI_TASK - the connector's FreeRTOS task logs (reconnects, OTA), which is a second synchronous-logging context. Define NO_WIFI_TASK, or enable ASYNC_LOG."
+#endif
+#ifndef NO_ASYNC_WEB_SERVER
+#error "LionWifi: ESP32 without ASYNC_LOG requires NO_ASYNC_WEB_SERVER - async route handlers (and the library's own) run in the AsyncTCP task, which is a second synchronous-logging context. Define NO_ASYNC_WEB_SERVER, or enable ASYNC_LOG."
+#endif
+#endif
 
 #ifdef LIONWIFI_HTTP_OTA
 // Browser/curl firmware upload at /update (a FORWARD POST, unlike ArduinoOTA's
@@ -234,15 +267,21 @@ extern uint32_t _lwRtcSavedMagic;
 #define LIONWIFI_RTC_TIME_MAGIC 0x4C57524Dul // 'LWRM'
 #endif
 
+// The concrete web-server class of this build. Use it in your own signatures
+// (`Init(WebServerType &server)`, handler helpers, ...) instead of naming a platform class:
+// porting a sketch between ESP8266 and ESP32 then changes build flags, not code. Same idea
+// as LIONWIFI_FS for the filesystem.
 #ifdef ESP32
 #ifdef NO_ASYNC_WEB_SERVER
-extern WebServer server;
+typedef WebServer WebServerType;
 #else
-extern AsyncWebServer server;
+typedef AsyncWebServer WebServerType;
 #endif
 #else
-extern ESP8266WebServer server;
+typedef ESP8266WebServer WebServerType;
 #endif
+
+extern WebServerType server;
 
 #ifndef WIFI_CLIENT_TIMEOUT
 #define WIFI_CLIENT_TIMEOUT 3000
@@ -275,6 +314,22 @@ private:
     Array<String *> _ssids, _passwords;
     int _curApIdx = 0;
     uint32_t _minFreeMemory = 1000000; // seed high so the first heap sample always wins
+    uint32_t _minFreeStack = 0xFFFFFFFF; // same, for the stack low-water mark
+#if defined(ESP32) && !defined(NO_WIFI_TASK)
+    bool _loopFromSketchWarned = false; // warn once about an ignored Loop() from loop()
+#endif
+
+    // Free stack of the context that pumps Loop(): the ESP8266 cont stack, or on ESP32 the
+    // task running this. Note the differing units of the underlying calls — ESP-IDF's
+    // uxTaskGetStackHighWaterMark() reports BYTES (vanilla FreeRTOS reports words).
+    static uint32_t FreeStackBytes()
+    {
+#ifdef ESP32
+        return (uint32_t)uxTaskGetStackHighWaterMark(NULL);
+#else
+        return (uint32_t)ESP.getFreeContStack();
+#endif
+    }
     FsBrowser *_fsBrowser = nullptr;
     std::function<void()> _conEvent, _disconEvent, _timeSetEvent, _clearLogEvent, _pingEvent;
     // OTA hooks — forwarded to _myOta (which invokes them from ArduinoOTA's
@@ -634,11 +689,11 @@ public:
         // Memory stats
         out.print(F("<div class='global-status memory-status'>"));
 #ifndef ESP32
-        out.printf_P(PSTR("Heap: <b>%u</b>B (loop min <b>%u</b>) | Frag: <b>%d%%</b> | Stack: <b>%u</b>B"),
-                      freeHeap, _minFreeMemory, frag, freeStack);
+        out.printf_P(PSTR("Heap: <b>%u</b>B (loop min <b>%u</b>) | Frag: <b>%d%%</b> | Stack: <b>%u</b>B (min <b>%u</b>)"),
+                      freeHeap, _minFreeMemory, frag, freeStack, _minFreeStack);
 #else
-        out.printf_P(PSTR("Heap: <b>%u</b>B (min <b>%u</b>) | Largest: <b>%s</b> (%u%%)"),
-                      freeHeap, _minFreeMemory, FsBrowser::FileSize(maxAlloc).c_str(), largestPct);
+        out.printf_P(PSTR("Heap: <b>%u</b>B (min <b>%u</b>) | Largest: <b>%s</b> (%u%%) | Stack min: <b>%u</b>B"),
+                      freeHeap, _minFreeMemory, FsBrowser::FileSize(maxAlloc).c_str(), largestPct, _minFreeStack);
 #endif
         out.print(F("</div>"));
 #endif
@@ -925,13 +980,37 @@ public:
             Connect();
         while (true)
         {
-            Loop();
+            LoopBody();
             vTaskDelay(1 / portTICK_PERIOD_MS);
         }
     }
 #endif
 
+    // Public entry point. In a build where the connector owns a FreeRTOS task, a call from
+    // the sketch's loop() would pump everything from TWO contexts at once — two parsers
+    // reading the same socket, half a request each. That shows up as nonsense in the log
+    // ("Invalid request: Referer: ...", remoteIP() reported as 0.0.0.0, the same URI handled
+    // twice, "Connection reset by peer") and is easy to mistake for broken authentication.
+    // Consumers keep one `_connector->Loop()` in loop() for every platform, so this is a
+    // no-op here rather than an error.
     void Loop()
+    {
+#if defined(ESP32) && !defined(NO_WIFI_TASK)
+        if (!_loopFromSketchWarned) // once: Loop() is called thousands of times a second
+        {
+            _loopFromSketchWarned = true;
+            Logger.Log_P(ILogger::LvlWarning,
+                         PSTR("WifiConnector::Loop() from the sketch IGNORED: this build pumps it "
+                              "from its own task. Define NO_WIFI_TASK to drive it from loop()."));
+        }
+        return;
+#else
+        LoopBody();
+#endif
+    }
+
+private:
+    void LoopBody()
     {
         SaveClockToRtc(); // snapshot time into RTC memory (no-op without LIONWIFI_RTC_CLOCK / before sync)
 
@@ -1139,6 +1218,7 @@ public:
                 _minFreeMemory = hfree;
                 Logger.Log_P(ILogger::LvlInfo, PSTR("====> New free heap = %lu (max %lu, frag %d)"), (unsigned long)_minFreeMemory, (unsigned long)hmax, hfrag);
             }
+            TrackStackLowWater();
         }
 #else
         uint32_t free = ESP.getFreeHeap();
@@ -1149,7 +1229,25 @@ public:
             _minFreeMemory = free;
             Logger.Log_P(ILogger::LvlInfo, PSTR("====> heap = %lu (max %lu)"), (unsigned long)_minFreeMemory, (unsigned long)maxAlloc);
         }
+        TrackStackLowWater();
         vTaskDelay(1);
+#endif
+    }
+
+    // Lowest free stack seen so far, logged whenever it drops. The status page shows the
+    // CURRENT free stack, which says nothing about the rare deep excursion that actually
+    // overflows — only a low-water mark catches those, and it costs one comparison per
+    // heap check. (Found a 1136 -> 624 byte drop on ESP8266 that way, in a path nobody
+    // suspected.) NO_MEMSTAT_IN_STATUS compiles it out together with the rest of the stats.
+    void TrackStackLowWater()
+    {
+#ifndef NO_MEMSTAT_IN_STATUS
+        uint32_t freeStack = FreeStackBytes();
+        if (freeStack && freeStack < _minFreeStack)
+        {
+            _minFreeStack = freeStack;
+            Logger.Log_P(ILogger::LvlInfo, PSTR("----> New free stack = %lu"), (unsigned long)_minFreeStack);
+        }
 #endif
     }
 

@@ -170,7 +170,8 @@ Override via `build_flags`. The full list lives in the header banner of
 | `NO_ASYNC_WEB_SERVER` (ESP32) | off | Use core `WebServer` instead of ESPAsyncWebServer |
 | `USE_SD_CARD` [+ `SDFAT`] | off | Also browse an SD card (SdFat with `SDFAT`) |
 | `LIONWIFI_NAME_MAX` | 63 | Max listed filename length (bytes); raise for long UTF-8 names |
-| `NO_MEMSTAT_IN_STATUS` | off | Drop heap/frag stats from the status page |
+| `LIONWIFI_NO_ARDUINO_OTA` | off | Compile ArduinoOTA (espota) out — drops it and the mDNS responder it starts, ~34 KB of flash on ESP32. Use with `LIONWIFI_HTTP_OTA` |
+| `NO_MEMSTAT_IN_STATUS` | off | Drop heap/frag/stack stats from the status page (also the stack low-water tracking) |
 | `NO_WIFI_STAT_IN_STATUS` | off | Drop the WiFi RSSI/quality/channel line from the status page (shown by default) |
 | `FS_BROWSER_CSS` | built-in | Replace the file-browser stylesheet (string literal) |
 | `NO_FS_BROWSER_CSS` | off | Drop the file-browser stylesheet — saves ~2 KB flash |

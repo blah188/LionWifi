@@ -3,6 +3,69 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.4.0 — 2026-09-05
+
+### Changed
+- **Dependencies are declared by name, without the `leva` owner.** An owner-qualified
+  requirement can only be satisfied by a registry package, so a consumer who replaces one of
+  these libraries with `symlink://` for local work still got the registry copy installed
+  beside it — and the installed directory shadows the link, silently building sources nobody
+  is editing. Name-only requirements let an installed (symlinked) package of the right
+  version satisfy them. The names are unique enough that resolution stays unambiguous, and
+  `library.properties` has always listed them this way.
+
+### Added
+- **Compile-time guards for synchronous logging on ESP32.** LionLogger built without
+  `ASYNC_LOG` writes the log file in the caller's own context through a shared `File`
+  member, so the firmware may log from exactly one FreeRTOS task — a second one closes
+  that handle underneath the first. LionWifi adds such a task in two configurations, and
+  in both it is the library's *own* logging (reconnects, OTA progress, the file browser),
+  so "my handlers don't log" is no defence. Both are visible to the preprocessor, so on
+  ESP32 without `ASYNC_LOG` the header now `#error`s unless `NO_WIFI_TASK` and
+  `NO_ASYNC_WEB_SERVER` are both defined, instead of leaving a log file to be corrupted
+  in the field.
+
+### Fixed
+- **File upload crashed the sync server on ESP32** (`NO_ASYNC_WEB_SERVER`): a panic in
+  `WebServer::_parseFormUploadAborted()`, preceded by nonsense in the log such as
+  `Invalid request: GIF89a`. The upload callback was answering the client — `DoAuth()`
+  sends a 401 on failure, and `UPLOAD_FILE_END` sent the 303 redirect — while the request
+  body was still being parsed. That desynchronises the connection: the rest of the body is
+  then read as the next request line, and the parser eventually takes the abort path, where
+  the ESP32 core dereferences a null `_currentUpload`. This header already documented the
+  rule for the async server ("the onUpload callback may not send the HTTP response"); the
+  sync branch now follows it too — the callback records the outcome, and the route's
+  `onRequest` handler (which runs once the whole body is consumed) answers.
+  ESP8266 was unaffected: its WebServer tolerates the early response.
+- **`UPLOAD_FILE_ABORTED` was not handled at all** in the sync branch, so an interrupted
+  upload left the file handle open and kept the previous outcome recorded.
+- **`Loop()` called from the sketch is now a no-op where the connector owns a task**
+  (ESP32 without `NO_WIFI_TASK`). Consumers keep one `_connector->Loop()` in `loop()` for
+  every platform; on such a build that pumped everything from two contexts at once — two
+  parsers reading the same socket, half a request each. With the sync web server it looks
+  like broken authentication: `Invalid request: Referer: ...` in the log, `remoteIP()`
+  reported as `0.0.0.0`, the same URI handled twice, `Connection reset by peer`. Nothing
+  hinted at the real cause, so the call is now refused — and it says so once in the log
+  ("Loop() from the sketch IGNORED...") instead of failing silently.
+
+### Added
+- **`WebServerType`** — a typedef for the concrete web-server class of this build
+  (`ESP8266WebServer` / `AsyncWebServer` / `WebServer`). Use it in your own signatures
+  instead of naming a platform class, and porting a sketch changes build flags rather than
+  code. Same idea as `LIONWIFI_FS` for the filesystem.
+- **`LIONWIFI_NO_ARDUINO_OTA`** — compiles ArduinoOTA out. That is the espota upload path,
+  and its `begin()` also starts an mDNS responder: together ~34KB of flash on ESP32, useless
+  to a build that flashes through the HTTP OTA page. The class and its hooks stay and
+  `Begin()`/`Loop()` become no-ops, so no consumer code changes.
+- **Stack low-water mark**, logged when it drops (`----> New free stack = N`) and shown on
+  the status page next to the current value. The current free stack says nothing about the
+  rare deep excursion that actually overflows; only a low-water mark catches those. Costs
+  one comparison per heap check, and compiles out with `NO_MEMSTAT_IN_STATUS`.
+- **Compile-time warning for `NO_ASYNC_WEB_SERVER` without `NO_WIFI_TASK`**: that pair leaves
+  the sync web server pumped from the connector's task, so route handlers run concurrently
+  with `loop()`. It works for a sketch whose handlers touch nothing shared — hence a warning
+  rather than an `#error` — but it is never what a port from ESP8266 wants.
+
 ## 1.3.4 — 2026-09-03
 
 ### Fixed

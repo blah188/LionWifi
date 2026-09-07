@@ -210,12 +210,13 @@ private:
     FsFile _fsSdUploadFile;
 #endif
     File _fsUploadFile;
-#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-    // Async uploads: the onUpload callback may not send the HTTP response (only
-    // the onRequest callback, which runs last, may). So onUpload records the
-    // outcome here and the route's onRequest handler turns it into a redirect/500.
+    // An upload callback may NOT send the HTTP response — neither on the async server nor
+    // on the sync one. It runs while the request body is still being parsed, so answering
+    // there (a redirect, a 500, or the 401 of an auth check) leaves the connection out of
+    // step: the remaining body is then read as the next request line. So the callback only
+    // records the outcome here, and the route's onRequest handler — which runs after the
+    // whole body has been consumed — turns it into a redirect/500.
     bool _uploadOk = false;
-#endif
 
 public:
     // `server` is the consumer's web server (type varies by platform/build).
@@ -343,6 +344,18 @@ public:
         return true;
     }
 #else
+    // Check the credentials WITHOUT answering. Needed wherever a response must not be sent
+    // yet — above all in an upload callback: any response while the body is still being
+    // received desynchronises the connection, and the rest of the body is then parsed as
+    // the next request line ("Invalid request: GIF89a" and friends).
+    bool IsAuthenticated()
+    {
+#ifdef NO_AUTH
+        return true;
+#endif
+        return !_doAuth || _server.authenticate(_username, _password);
+    }
+
     bool DoAuth()
     {
 #ifdef NO_AUTH
@@ -1307,14 +1320,21 @@ public:
         }
     }
 #else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
+    // Receives the file. MUST NOT send anything: see the comment on _uploadOk. The route's
+    // onRequest handler does the answering (and the user-facing auth challenge).
     void HandleFileUpload(bool sd)
     {
-        if (!DoAuth())
-            return;
-
         HTTPUpload &upload = _server.upload();
         if (upload.status == UPLOAD_FILE_START)
         {
+            _uploadOk = false;
+            // Credentials are checked without answering: an unauthenticated client must not
+            // get a file written, but the 401 has to wait for onRequest.
+            if (!IsAuthenticated())
+            {
+                Logger.Log_P(ILogger::LvlWarning, PSTR("Upload refused: not authenticated"));
+                return;
+            }
             String filename = upload.filename;
             if (!filename.startsWith("/")) // both SD (ESP32 VFS) and the internal FS need a leading '/'
                 filename = "/" + filename;
@@ -1340,22 +1360,39 @@ public:
         }
         else if (upload.status == UPLOAD_FILE_END)
         {
+            _uploadOk = (bool)_fsUploadFile; // no open file = refused earlier (no auth, no space)
             if (_fsUploadFile)
-            {                          // If the file was successfully created
-                _fsUploadFile.close(); // Close the file again
-                Logger.Log_P(ILogger::LvlInfo, PSTR("Upload end: %u bytes (OK)"), (unsigned)upload.totalSize);
-#ifdef USE_SD_CARD
-                _server.sendHeader(F("Location"), sd ? F("/sd/ls") : F("/spiffs/ls")); // Redirect the client to the success page
-#else
-                _server.sendHeader(F("Location"), F("/spiffs/ls")); // Redirect the client to the success page
-#endif
-                _server.send(303);
-            }
-            else
-            {
-                _server.send(500, __text_plain__F, F("500: couldn't create file"));
-            }
+                _fsUploadFile.close();
+            Logger.Log_P(_uploadOk ? ILogger::LvlInfo : ILogger::LvlError,
+                         PSTR("Upload end: %u bytes (%S)"), (unsigned)upload.totalSize,
+                         _uploadOk ? F("OK") : F("FAILED"));
         }
+        else if (upload.status == UPLOAD_FILE_ABORTED)
+        {
+            if (_fsUploadFile)
+                _fsUploadFile.close();
+            _uploadOk = false;
+            Logger.Log_P(ILogger::LvlWarning, PSTR("Upload aborted"));
+        }
+    }
+
+    // Answers an upload. Separate from the callback above because it runs from onRequest,
+    // i.e. after the whole request body has been consumed — only there is it safe to send.
+    void FinishUpload(bool sd)
+    {
+        if (!DoAuth()) // sending the 401 is fine here
+            return;
+        if (_uploadOk)
+        {
+#ifdef USE_SD_CARD
+            _server.sendHeader(F("Location"), sd ? F("/sd/ls") : F("/spiffs/ls"));
+#else
+            _server.sendHeader(F("Location"), F("/spiffs/ls"));
+#endif
+            _server.send(303);
+        }
+        else
+            _server.send(500, __text_plain__F, F("500: upload failed"));
     }
 #endif
 
@@ -1377,9 +1414,9 @@ public:
         _server.on("/sd/ls", HTTP_GET,
                    [this]() { HandleLs(true); });
         _server.on(
-            "/sd/ls", HTTP_POST,                 // if the client posts to the upload page
-            [this]() { _server.send(200); },     // Send status 200 (OK) to tell the client we are ready to receive
-            [this]() { HandleFileUpload(true); } // Receive and save the file
+            "/sd/ls", HTTP_POST,                  // if the client posts to the upload page
+            [this]() { FinishUpload(true); },     // runs last: auth challenge + redirect/500
+            [this]() { HandleFileUpload(true); }  // receives the file, answers nothing
         );
 #endif
 #endif
@@ -1415,9 +1452,9 @@ public:
             _server.send(401, __text_plain__F, F("You are logged out"));
         });
         _server.on(
-            F("/spiffs/ls"), HTTP_POST,              // if the client posts to the upload page
-            [this]() { _server.send(200); },      // Send status 200 (OK) to tell the client we are ready to receive
-            [this]() { HandleFileUpload(false); } // Receive and save the file
+            F("/spiffs/ls"), HTTP_POST,               // if the client posts to the upload page
+            [this]() { FinishUpload(false); },     // runs last: auth challenge + redirect/500
+            [this]() { HandleFileUpload(false); }  // receives the file, answers nothing
         );
         _server.onNotFound([this]() {
             // uri() is percent-encoded on the sync server — decode it so names
