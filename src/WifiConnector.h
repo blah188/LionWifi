@@ -78,8 +78,16 @@
 //                            second task that logs, and synchronous logging tolerates
 //                            exactly one. Enforced by #error further down.
 //   CORE_WIFI                FreeRTOS core for the WiFi task (default 1).
+//   WIFI_BEST_AP             Connect to the STRONGEST access point with the configured
+//                            SSID instead of the first one found (ESP32). Needed whenever
+//                            several points share an SSID — mesh, extender, second router.
 //   DISABLE_11N              Force 802.11b/g (some APs misbehave with 11n).
-//   MAX_WIFI_POWER           Set max TX power for weak links.
+//   WIFI_BW20                Force a 20 MHz channel (HT20) on the station link — steadier on
+//                            a weak or noisy one than the default 40 MHz.
+//   MAX_WIFI_POWER           Set max TX power for weak links (that is also the default).
+//   WIFI_TX_POWER            Set TX power explicitly, as a wifi_power_t enumerator. Meant
+//                            for LOWERING it: small boards with weak decoupling fail to
+//                            associate at full power (-D WIFI_TX_POWER=WIFI_POWER_8_5dBm).
 //
 //   FsBrowser extras:
 //   USE_SD_CARD [+ SDFAT]    Also browse an SD card (SdFat when SDFAT is set).
@@ -339,6 +347,13 @@ private:
     WiFiClient *_client = nullptr;
     HTTPClient *_httpClient = nullptr;
     bool _otaStarted = false;
+#ifdef ESP32
+    // Filled by the WiFi event callback, printed by Loop(). The callback runs in the
+    // Arduino event task, and the log must be written from ONE task only — so the
+    // callback just leaves the reason here and does not touch the logger.
+    volatile uint8_t _discReason = 0;
+    volatile bool _discReasonPending = false;
+#endif
 #ifdef LIONWIFI_HTTP_OTA
     bool _httpOtaAuthOk = false; // latched when the upload starts; response gated on it
 #endif
@@ -869,6 +884,33 @@ public:
         // on connect to (re)start SNTP; here it just sets the TZ env.
         configTime(NTP_TZ_OFFSET_SEC, 0, NTP_SERVER);
 
+#ifdef ESP32
+        // A failed association is otherwise completely silent: the log shows nothing but
+        // "Connecting/Reconnecting" repeating forever, and that covers several unrelated
+        // faults. The SDK does say which (wifi_err_reason_t):
+        //   201 NO_AP_FOUND             — the access point is not seen at all (coverage,
+        //                                 channel, wrong band)
+        //   15  4WAY_HANDSHAKE_TIMEOUT  — it is seen but the handshake never completes:
+        //                                 a weak link, or a supply sagging on TX peaks
+        //   2/4 AUTH_EXPIRE/ASSOC_EXPIRE— the access point drops us (loaded extender,
+        //                                 full client table)
+        //   205 CONNECTION_FAIL         — association did not finish
+        // The callback runs in the Arduino event task, so it only records the reason;
+        // Loop() prints it from our own task (the log tolerates a single writer).
+        WiFi.onEvent([this](arduino_event_id_t, arduino_event_info_t info)
+                     {
+                         const uint8_t reason = (uint8_t)info.wifi_sta_disconnected.reason;
+                         // ASSOC_LEAVE means the station left of its own accord — that is
+                         // our own disconnect(true) in Connect()/Reconnect(), fired on every
+                         // retry. Reporting it would bury the reasons that mean something.
+                         if (reason == WIFI_REASON_ASSOC_LEAVE)
+                             return;
+                         _discReason = reason;
+                         _discReasonPending = true;
+                     },
+                     ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+#endif
+
         _myOta = new MyOta();
         // Push any OTA hooks registered before Setup().
         if (_otaStartEvent)
@@ -892,6 +934,18 @@ public:
         _client->setTimeout(WIFI_CLIENT_TIMEOUT);
         _httpClient = new HTTPClient();
         _httpClient->setTimeout(WIFI_CLIENT_TIMEOUT);
+        // Connection reuse OFF, and this is not a preference — with a SHARED client it is
+        // broken by construction. HTTPClient::connect() reuses whatever socket the client
+        // holds the moment connected() is true and never compares the host, while
+        // begin(client, url) forces _canReuse = true and calls disconnect(true), which under
+        // reuse deliberately leaves the previous socket open. So the request meant for the
+        // next host goes into the socket of the previous one. And even talking to the same
+        // host again it fails: a small ESP web server answers "Connection: keep-alive" with
+        // a two-second idle timeout, so by the time a poller comes back the peer has closed
+        // and the write lands nowhere — an HTTPC_ERROR_READ_TIMEOUT (-11) that looks exactly
+        // like a slow device. Every request now opens its own connection, which is what the
+        // peers expect anyway.
+        _httpClient->setReuse(false);
 
         // LionLogger integration: expose the current-day log file over HTTP
         // (/log[/tail], /spiffs/log[/tail]) plus a /restart route. The generic
@@ -1033,13 +1087,27 @@ private:
 #endif
         }
 
+#ifdef ESP32
+        // Print what the event callback recorded — see the WiFi.onEvent() comment in
+        // Setup() for the reason codes worth knowing.
+        if (_discReasonPending)
+        {
+            _discReasonPending = false;
+            Logger.Log_P(ILogger::LvlWarning, PSTR("WiFi disconnect reason %u"), (unsigned)_discReason);
+        }
+#endif
+
         if (WiFi.status() == WL_CONNECTED)
         {
             if (!_connected)
             {
                 _connected = true;
                 _lastConnectedTime = millis();
-                Logger.Log_P(ILogger::LvlInfo, PSTR("Connected to %s; IP address: %s"), _ssids[_curApIdx]->c_str(), WiFi.localIP().toString().c_str());
+                // RSSI right at association: the single number that separates "weak link"
+                // from every other explanation. Above -65 dBm is comfortable, -75 marginal,
+                // below -80 is where handshakes start timing out.
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Connected to %s; IP address: %s; RSSI %d"),
+                             _ssids[_curApIdx]->c_str(), WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
                 configTime(NTP_TZ_OFFSET_SEC, 0, NTP_SERVER);
 #if defined(ESP32)
                 server.begin();
@@ -1055,7 +1123,37 @@ private:
             }
             _myOta->Loop();
 #if defined(NO_ASYNC_WEB_SERVER) || !defined(ESP32)
+#if defined(LIONWIFI_WEB_TRACE) || defined(LIONWIFI_WEB_STALL_LOG_MS)
+            {
+                // handleClient() is opaque from the outside: page handlers, the FS browser
+                // and OTA all live inside it, and on ESP32 a socket write to a client that
+                // stopped reading blocks with no ceiling. Timing the call is what separates
+                // "the web stalled the loop" from every other cause — and that is all it
+                // can do.
+                //
+                // The request CANNOT be named from here, so do not try: _handleRequest()
+                // clears _currentUri when it finishes (WebServer.cpp), and remoteIP() on the
+                // by-then-closed client calls getpeername() on a dead fd, ignores the
+                // failure and returns an uninitialised address. That printed convincing
+                // public IPs out of stack garbage — worse than no information at all. To
+                // attribute a stall to a page, instrument the handlers themselves.
+                const uint32_t webStart = millis();
+                server.handleClient();
+                const uint32_t webMs = millis() - webStart;
+#ifdef LIONWIFI_WEB_TRACE
+                // Only the slow ones: handleClient() runs every loop iteration (about a
+                // millisecond even with no request), so tracing every call drowns the port.
+                if (webMs >= LIONWIFI_WEB_TRACE_MS)
+                    Serial.printf_P(PSTR("WEB %lu ms\n"), (unsigned long)webMs);
+#endif
+#ifdef LIONWIFI_WEB_STALL_LOG_MS
+                if (webMs >= LIONWIFI_WEB_STALL_LOG_MS)
+                    Logger.Log_P(ILogger::LvlWarning, PSTR("WEB STALL %lu ms"), (unsigned long)webMs);
+#endif
+            }
+#else
             server.handleClient();
+#endif
 #endif
 #ifdef PING_ROUTER
             if (millis() - _lastRouterPingTime > PING_ROUTER_INTERVAL)
@@ -1257,22 +1355,68 @@ protected:
         if (++_curApIdx >= _ssids.Length())
             _curApIdx = 0;
     }
-    void Connect()
+    // Station mode plus link tuning. Called before EVERY association attempt, the
+    // retries included: a full teardown (disconnect(true) stops the radio) may drop
+    // these, and they only take effect on the next association anyway.
+    void ApplyRadioSettings()
     {
-        _lastConnectStartTime = millis();
 #ifdef ESP32
         WiFi.mode(WIFI_STA);
         WiFi.setSleep(WIFI_PS_NONE);
+        // Radio settings below must sit HERE: after WiFi.mode() (before it esp_wifi is not
+        // initialised yet and the calls fail) and before WiFi.begin() (applied later, they
+        // only take effect on the NEXT reconnect).
 #ifdef DISABLE_11N // force 802.11b/g only (some APs are flaky with 11n on ESP32)
-        esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
+        // WIFI_IF_STA, not WIFI_IF_AP: this used to configure the access-point interface,
+        // which a station-only sketch never brings up — so the flag quietly did nothing to
+        // the link it was meant to fix. No consumer in the fleet had it set, so nobody was
+        // relying on the old no-op behaviour.
+        esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G);
 #endif
-#ifdef MAX_WIFI_POWER // crank TX power to the maximum for weak-signal links
+#ifdef WIFI_BEST_AP // pick the STRONGEST access point with this SSID, not the first found
+        // The default is WIFI_FAST_SCAN, which stops at the first matching access point and
+        // connects to it. With several points sharing one SSID (a mesh, an extender, or just
+        // two routers) that is a coin toss: a hub sat on an extender 20 m away through a
+        // wall at RSSI -82 while another point stood one metre from it. Sorting by signal is
+        // already the default, but it has nothing to sort until the scan covers all channels.
+        // Measured after the switch: -82 -> -41.
+        // Cost: a full channel sweep on every association attempt, a second or two.
+        WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+        WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL); // the default, set explicitly
+#endif
+#ifdef WIFI_BW20 // force a 20 MHz channel width (HT20) on the station link
+        // A narrower channel collects less noise, so on a weak link it holds better: at
+        // -76 dBm against an access point running 40 MHz on a busy channel, HT20 buys real
+        // SNR. Pair it with MAX_WIFI_POWER when the link is weak rather than noisy.
+        esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
+#endif
+        // TX power. The default is already the maximum, so MAX_WIFI_POWER is mostly a
+        // statement of intent; WIFI_TX_POWER is the interesting one, and it exists to be
+        // set LOWER. Small boards (the ESP32-C3 SuperMini and its kin) have weak supply
+        // decoupling and misbehave at full power — failing to associate, or associating and
+        // dropping — where 8.5dBm connects happily. Pass any wifi_power_t enumerator, e.g.
+        // -D WIFI_TX_POWER=WIFI_POWER_8_5dBm.
+#ifdef WIFI_TX_POWER
+        WiFi.setTxPower(WIFI_TX_POWER);
+#elif defined(MAX_WIFI_POWER)
         WiFi.setTxPower(WIFI_POWER_19_5dBm);
 #endif
 #else
             WiFi.mode(WIFI_STA);
             WiFi.setSleepMode(WIFI_NONE_SLEEP);
 #endif
+    }
+    void Connect()
+    {
+        _lastConnectStartTime = millis();
+        // Order matters, and it is NOT the intuitive one. Tuning must come BEFORE the
+        // teardown: disconnect(true) stops the radio, but the configured mode stays
+        // WIFI_MODE_STA, and WiFiGenericClass::mode() returns early when the mode already
+        // matches (WiFiGeneric.cpp:1252) -- so a WiFi.mode(WIFI_STA) after the teardown is
+        // a no-op and the esp_wifi_* calls land on a stopped stack, silently (nobody checks
+        // their return codes). Tried the other way round: association then failed with
+        // reason 2 (AUTH_EXPIRE) and 39 (TIMEOUT), retry after retry.
+        ApplyRadioSettings();
         WiFi.persistent(false);
         WiFi.disconnect(true);
 #ifndef QUIET_WIFI_LOGS
@@ -1287,6 +1431,23 @@ protected:
 #ifndef QUIET_WIFI_LOGS
         // Never log the PSK — SSID only.
         Logger.Log_P(ILogger::LvlInfo, PSTR("Reconnecting to %s"), _ssids[_curApIdx]->c_str());
+#endif
+#ifdef ESP32
+        // Same sequence as Connect(), and deliberately so. A retry used to be a bare
+        // begin(), but on ESP32 begin() on top of an association attempt that is still
+        // running does NOT restart it -- least of all with a different SSID: the previous
+        // attempt keeps going to its own timeout and the new credentials are ignored. Seen
+        // on an ESP32-C3 as an endless "Changing AP / Reconnecting" ladder every
+        // WIFI_CONNECT_TIMEOUT, minutes on end, with an access point in the same room.
+        // For why tuning precedes the teardown, see the comment in Connect().
+        //
+        // ESP8266 keeps the bare begin() below: its SDK handles a repeated begin() on its
+        // own, the endless-ladder symptom has never been seen there, and a fleet of 8266
+        // nodes has been reconnecting this way for years. A teardown there would also mean
+        // powering the radio down (disconnect(true) = wifioff) on a path that works.
+        ApplyRadioSettings();
+        WiFi.persistent(false);
+        WiFi.disconnect(true); // true = radio off; begin() below brings it back up
 #endif
         WiFi.begin(_ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
     }

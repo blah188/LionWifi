@@ -13,8 +13,27 @@
 // FsBrowser.cpp (the comparator, the shared PROGMEM MIME strings).
 // =============================================================================
 
-#ifdef ESP32
+// Keeps the long loops below (directory scans, the chunked listing) watchdog-safe. Two
+// different watchdogs, so two measures:
+//   * rtc_wdt_feed() pokes the RTC one. soc/rtc_wdt.h exists only for the original ESP32 —
+//     on a RISC-V target (C3, C6, ...) it does not even link — hence the target check.
+//   * vTaskDelay(1) yields to the idle task, which is what the TASK watchdog actually
+//     watches; poking anything would not satisfy it. Needed on every ESP32 target: do not
+//     assume our code sits on the core whose idle is unwatched, CORE_WIFI is a build flag
+//     and a consumer can put this very task on core 0, where a long scan would starve the
+//     watched idle task into a panic (5 s, CONFIG_ESP_TASK_WDT_PANIC=y).
+// One tick is 1 ms at the Arduino default of 1000 Hz, paid per directory entry / per chunk.
+// ESP8266 never called this and still does not: its loops are pumped differently.
+#if defined(ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
 #include "soc/rtc_wdt.h"
+#define LIONWIFI_WDT_FEED() do { rtc_wdt_feed(); vTaskDelay(1); } while (0)
+#elif defined(ESP32)
+#define LIONWIFI_WDT_FEED() vTaskDelay(1)
+#else
+#define LIONWIFI_WDT_FEED() ((void)0)
+#endif
+
+#ifdef ESP32
 #ifdef NO_ASYNC_WEB_SERVER
 #include <WebServer.h>
 #else
@@ -105,6 +124,13 @@ extern const char __slash_favicon_ico__P[];
 #else
 #define LIONWIFI_FS_CHUNK 512
 #endif
+#endif
+
+// Diagnostics threshold (LIONWIFI_WEB_TRACE): only calls and chunks at least this slow are
+// printed to Serial. handleClient() runs every loop iteration, so tracing unconditionally
+// floods the port.
+#ifndef LIONWIFI_WEB_TRACE_MS
+#define LIONWIFI_WEB_TRACE_MS 200
 #endif
 
 // ---- File-listing look & feel ----------------------------------------------
@@ -538,6 +564,10 @@ public:
             _server.send(200, GetContentType(name), emptyString);
             uint8_t chunk[LIONWIFI_FS_CHUNK];
             size_t sent = 0;
+#ifdef LIONWIFI_WEB_TRACE
+            const uint32_t tailStart = millis();
+            unsigned tailChunks = 0;
+#endif
             while (sent < tailLen)
             {
                 size_t want = tailLen - sent;
@@ -546,17 +576,48 @@ public:
                 int n = dataFile.read(chunk, want);
                 if (n <= 0)
                     break;
+#ifdef LIONWIFI_WEB_TRACE
+                // Every chunk is one socket write, and on ESP32 a write to a client
+                // that stopped reading burns 10 s (WIFI_CLIENT_MAX_WRITE_RETRY x 1 s
+                // of select) without sending a byte. An 8 KB tail is 16 chunks, so a
+                // silent client costs 160 s here -- print the slow ones by name.
+                const uint32_t chunkStart = millis();
+#endif
                 _server.sendContent((const char *)chunk, (size_t)n);
                 sent += n;
+#ifdef LIONWIFI_WEB_TRACE
+                const uint32_t chunkMs = millis() - chunkStart;
+                tailChunks++;
+                if (chunkMs >= LIONWIFI_WEB_TRACE_MS)
+                    Serial.printf_P(PSTR("  tail chunk %u (%d B): %lu ms\n"), tailChunks, n,
+                                    (unsigned long)chunkMs);
+#endif
             }
             dataFile.close();
             Logger.UnlockFsSemaphore();
+#ifdef LIONWIFI_WEB_TRACE
+            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes in %lu ms (%u chunks)"),
+                         name, sd ? "Sd" : "SP", (unsigned)sent,
+                         (unsigned long)(millis() - tailStart), tailChunks);
+#else
             Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)sent);
+#endif
             return true;
         }
+#ifdef LIONWIFI_WEB_TRACE
+        const uint32_t fileStart = millis();
+#endif
         size_t sent = _server.streamFile(dataFile, GetContentType(name));
         dataFile.close();
         Logger.UnlockFsSemaphore();
+#ifdef LIONWIFI_WEB_TRACE
+        // streamFile() writes in HTTP_DOWNLOAD_UNIT_SIZE pieces internally, so the
+        // same per-write stall applies; we can only time the whole transfer here.
+        const uint32_t fileMs = millis() - fileStart;
+        if (fileMs >= LIONWIFI_WEB_TRACE_MS)
+            Serial.printf_P(PSTR("WEB file %s: %u B in %lu ms\n"), name, (unsigned)sent,
+                            (unsigned long)fileMs);
+#endif
 #ifndef LOG_FAVICON
         if (strcasecmp_P(name, __slash_favicon_ico__P) != 0)
 #endif
@@ -933,7 +994,7 @@ public:
 #endif
         {
 #ifdef ESP32
-            rtc_wdt_feed();
+            LIONWIFI_WDT_FEED();
             DirEntry entry(file.name());
             entry.size = file.size();
 #ifdef USE_FILE_TIME
@@ -984,7 +1045,7 @@ public:
         while (file = root.openNextFile())
         {
 #ifdef ESP32
-            rtc_wdt_feed();
+            LIONWIFI_WDT_FEED();
             DirEntry entry(file.name());
             entry.size = file.size();
 #ifdef USE_FILE_TIME
@@ -1209,7 +1270,7 @@ public:
                         }
                         else if (st->phase == 2) { self->renderLsFoot(ss, st->stats); st->phase = 3; }
                         else break; // phase 3: whole page emitted
-                        rtc_wdt_feed();
+                        LIONWIFI_WDT_FEED();
                         if (st->pending.length() == 0) continue;
                     }
                     size_t avail = st->pending.length() - st->pos;

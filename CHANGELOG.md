@@ -3,6 +3,93 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.5.0 — 2026-09-10
+
+### Added
+- **`WIFI_BEST_AP`** — connect to the strongest access point carrying the configured SSID
+  instead of the first one the scan happens to find (ESP32). The default `WIFI_FAST_SCAN`
+  stops at the first match, and sorting by signal — already the default — has nothing to
+  sort until the scan covers every channel. With several points sharing an SSID this is a
+  coin toss: a hub was found sitting on an extender 20 m away through a wall at RSSI -82
+  while another point stood one metre from it; the flag turned that into -41 immediately.
+  Costs a full channel sweep (a second or two) per association attempt.
+- **Association failures now say why.** A `WiFi.onEvent` hook records the
+  `wifi_err_reason_t` from `ARDUINO_EVENT_WIFI_STA_DISCONNECTED` and `Loop()` prints it as
+  `WiFi disconnect reason N` — 201 `NO_AP_FOUND` (not seen at all), 15
+  `4WAY_HANDSHAKE_TIMEOUT` (seen, handshake never completes: weak link or a supply sagging
+  on TX peaks), 2/4 `AUTH_EXPIRE`/`ASSOC_EXPIRE` (the access point drops us). Before this a
+  failing connect logged nothing but `Connecting/Reconnecting` forever, which covers several
+  unrelated faults. `ASSOC_LEAVE` (8) is filtered out: that is our own `disconnect()`.
+  The callback runs in the Arduino event task, so it only records the code — the logger
+  tolerates a single writing task, so printing happens in `Loop()`.
+- **Web timing diagnostics, off by default.** `LIONWIFI_WEB_TRACE` prints `WEB <ms>` to
+  Serial for calls slower than `LIONWIFI_WEB_TRACE_MS` (200) and times the individual chunks
+  of a served file/log tail; `LIONWIFI_WEB_STALL_LOG_MS` puts slow calls in the log as
+  `WEB STALL <ms>`. Deliberately no URI and no client IP: `_handleRequest()` clears
+  `_currentUri` when it finishes, and `remoteIP()` on the closed client calls
+  `getpeername()` on a dead fd, ignores the failure and returns an uninitialised address —
+  which printed convincing public IPs out of stack garbage. Attribute a stall to a page by
+  instrumenting the handler, not from here.
+- **RSSI in the connect line** (`Connected to X; IP address: Y; RSSI -63`) — the one number
+  that separates "weak link" from every other explanation, on both cores.
+- **`WIFI_TX_POWER`** — sets the station TX power explicitly to any `wifi_power_t`
+  enumerator, and it exists to be set LOWER (`-D WIFI_TX_POWER=WIFI_POWER_8_5dBm`). Small
+  boards - the ESP32-C3 SuperMini and its relatives - have weak supply decoupling and
+  misbehave at full power: they fail to associate, or associate and drop. `MAX_WIFI_POWER`
+  remains, but it only states an intent, since maximum is already the default.
+- **`WIFI_BW20`** — forces a 20 MHz channel (HT20) on the station link instead of the
+  default 40. A narrower channel collects less noise, so a weak link holds better: at
+  -76 dBm against an access point running 40 MHz on a busy channel this buys real SNR.
+  Both radio settings are applied after `WiFi.mode()` (before it esp_wifi is not yet
+  initialised) and before `WiFi.begin()` (applied later they would only take effect on the
+  next reconnect).
+
+### Fixed
+- **Retries never restarted the association (ESP32).** `Reconnect()` called `WiFi.begin()`
+  on top of an attempt that was still running, and on ESP32 that does not restart it — least
+  of all with a different SSID: the previous attempt runs to its own timeout and the new
+  credentials are ignored. On an ESP32-C3 this showed as an endless `Changing AP /
+  Reconnecting` ladder, minutes on end, with an access point in the same room. It now tears
+  the station down first, exactly as `Connect()` always did — which is why the FIRST attempt
+  worked. **ESP8266 keeps the bare `begin()`**: its SDK copes with a repeated `begin()`, the
+  symptom has never appeared there, and a teardown would power the radio down on a path that
+  a fleet of nodes has used for years.
+  The tuning now lives in one place (`ApplyRadioSettings()`) shared by the first attempt
+  and every retry, and it runs BEFORE the teardown — which looks wrong but is not:
+  `disconnect(true)` stops the radio while leaving the configured mode at `WIFI_MODE_STA`,
+  and `WiFiGenericClass::mode()` returns early when the mode already matches
+  (`WiFiGeneric.cpp:1252`), so tuning after a teardown lands on a stopped stack and is
+  silently lost (no caller checks those return codes). Measured: with the order reversed,
+  association failed with reason 2 (`AUTH_EXPIRE`) and 39 (`TIMEOUT`) retry after retry.
+- **`DISABLE_11N` configured the wrong interface** and therefore did nothing: it called
+  `esp_wifi_set_protocol(WIFI_IF_AP, ...)`, the access-point interface, which a station-only
+  sketch never brings up. Now `WIFI_IF_STA`. No consumer in the fleet had the flag set, so
+  nobody depended on the old no-op.
+- **Shared HTTP client reused connections across hosts** (ESP32 only, and it did not need
+  ESP32 to be wrong - only different). `SharedHttpClient(url)` hands the same `WiFiClient` to
+  `HTTPClient::begin()`, and the ESP32 core's `begin()` sets `_canReuse = true` before
+  `disconnect(true)`, which under reuse deliberately leaves the previous socket open "otherwise
+  it will free some of the memory used by _client". `HTTPClient::connect()` then returns early
+  on `connected()` alone and never compares the host, so a request meant for the next node was
+  written into the socket of the previous one. Even against the same node it broke: a small ESP
+  web server answers `Connection: keep-alive` with a two-second idle timeout, so a poller
+  returning half a minute later wrote into a peer that had long closed and got
+  HTTPC_ERROR_READ_TIMEOUT (-11) - indistinguishable from a slow device, and the reason a pile
+  of -11/-1/EmptyInput/InvalidInput errors were blamed on the nodes for months. The ESP8266
+  core does the opposite in the same function (`_canReuse = false` with a comment saying it is
+  cleared so that disconnect closes), which is why the very same code was well-behaved there.
+  The shared client now has `setReuse(false)`: one connection per request, which is what these
+  peers expect anyway.
+- **Did not link on RISC-V targets** (ESP32-C3 and its relatives): the directory scans and the
+  chunked listing called `rtc_wdt_feed()`, and `soc/rtc_wdt.h` exists only for the original
+  ESP32 — everywhere else the build ended with `undefined reference to rtc_wdt_feed`. The call
+  now sits behind `LIONWIFI_WDT_FEED()`, which pokes the RTC watchdog only where that API
+  exists and, on every ESP32 target, yields a tick to the idle task. The tick is the part that
+  matters: the RTC watchdog is the bootloader's, while the one that can actually fire in these
+  loops is the TASK watchdog, and that watches the idle task — poking anything does not satisfy
+  it. It is needed on any core, too: `CORE_WIFI` is a build flag, so a consumer can pin this
+  task to core 0, where a long scan starves the watched idle task into a panic.
+
 ## 1.4.0 — 2026-09-05
 
 ### Changed
