@@ -165,6 +165,8 @@ Override via `build_flags`. The full list lives in the header banner of
 | `WIFI_CONNECT_TIMEOUT` | `20000` | Per-AP attempt (ms) before rotating SSID |
 | `WIFI_FATAL_CONNECT_TIMEOUT` | `180000` | Reboot after this long disconnected (ms) |
 | `PING_ROUTER` | off | Router IP/host → enable ping-and-reboot watchdog |
+| `WIFI_BEST_AP` | off | Associate with the **strongest** point carrying the SSID, not the first one found. For meshes/extenders/a second router; costs a channel sweep (~2 s) per association attempt |
+| `LIONWIFI_GARP_INTERVAL_MS` | `0` (off) | Broadcast a gratuitous ARP on association and every N ms, so the whole L2 domain learns which access point we are on. Also logs a silent roam. `120000` is a sane value |
 | `QUIET_WIFI_LOGS` | off | Suppress connect/reconnect log lines |
 | `NO_WIFI_TASK` (ESP32) | off | Run `Loop()` from your `loop()` instead of a task |
 | `NO_ASYNC_WEB_SERVER` (ESP32) | off | Use core `WebServer` instead of ESPAsyncWebServer |

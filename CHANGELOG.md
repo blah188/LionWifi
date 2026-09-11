@@ -3,6 +3,45 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.6.0 — 2026-09-11
+
+### Added
+- **`WIFI_BEST_AP` now works on the ESP8266 too** (still off by default, on both cores).
+  That core has no `setScanMethod`/`setSortMethod`, so the ESP32 trick of asking the stack
+  for an all-channel scan is unavailable: the library now scans itself before each
+  association, keeps the loudest point carrying the SSID, and passes its channel and BSSID
+  to `begin()`. When the SSID is nowhere in the scan it falls back to a plain `begin()` —
+  better a coin toss than no association at all. The pin binds one attempt only; a point
+  that has gone away simply times out and the next retry scans again. Costs the same
+  ~2 s sweep per attempt as the ESP32 branch, plus the scan result list — which is why the
+  scan passes an SSID filter down to the SDK's `scan_config` instead of collecting every
+  access point in the neighbourhood; it is freed immediately via `scanDelete()` either way,
+  but it is a real allocation on a node with ~15 KB of heap.
+  `Connect()` and `Reconnect()` now share one `BeginStation()` so they cannot aim at
+  different points.
+- **`LIONWIFI_GARP_INTERVAL_MS`** — broadcast a gratuitous ARP ("this IP is at this MAC")
+  on every association and then every N ms. **OFF by default** (0 compiles the feature out);
+  it costs airtime on every node that enables it and only pays off where several access
+  points share the SSID. Cures the case where a node re-associates to a DIFFERENT point and
+  then stays invisible to part of the network for minutes: the node's own traffic is unicast
+  to the router, so it refreshes that one path, while the ARP caches of other nodes and the
+  forwarding tables of the other points keep pointing at the radio it left. Observed on a
+  window-opener node: after a network blip at 22:49 it re-associated to another point and
+  was unreachable for ~12 hours while cheerfully publishing MQTT the whole time; a later
+  reboot moved it again and it took 10.5 minutes for one of the pollers to see it. A
+  broadcast reaches the whole L2 domain at once. 120000 ms is a sane interval — much below
+  that just burns airtime, since broadcasts go out at the lowest basic rate and wake every
+  client. On ESP32 the send is handed to the tcpip task via `tcpip_callback` (calling
+  `etharp_*` from another task corrupts lwIP state); on ESP8266 it is a direct call, as the
+  whole Arduino core there talks to lwIP from `loop()`.
+  Each tick also compares the current BSSID and channel against the last announced pair,
+  which makes it a **silent-roam detector**: the SDK re-associates by itself after a deauth
+  and can land on a different point carrying the same SSID without `Connect()` running at
+  all — and when that beats one `Loop()` pass, `_connected` never flips, so not even the
+  "Connected to" line appears. Logging follows the usual dedup rule: `GARP` (debug) while
+  nothing changes, `GARP: AP CHANGED to <bssid> ch N, RSSI x` (info) when it does, and
+  `GARP armed on <bssid> ch N, every Nms` on association.
+
 ## 1.5.0 — 2026-09-10
 
 ### Added

@@ -43,11 +43,42 @@
 //   WIFI_CLIENT_TIMEOUT      Shared WiFi/HTTP client timeout      (default 3000)
 //   FORBID_WIFI_MONITOR      Disable the fatal-timeout auto-reboot.
 //   QUIET_WIFI_LOGS          Suppress the connect/reconnect/AP-change log lines.
+//   WIFI_BEST_AP             Associate with the STRONGEST access point carrying the
+//                            configured SSID instead of the first one found. OFF by
+//                            default (both cores). Needed wherever several points share
+//                            an SSID — mesh, extender, second router: the default picks
+//                            whichever answers first, which is a coin toss. A hub was
+//                            found sitting on an extender 20 m away through a wall at
+//                            RSSI -82 while another point stood one metre from it; the
+//                            flag turned that into -41. Costs a full channel sweep (a
+//                            second or two) per association ATTEMPT, retries included.
+//                            ESP32: WIFI_ALL_CHANNEL_SCAN + sort by signal, the core does
+//                            the rest. ESP8266: no such knob exists there, so the library
+//                            scans itself (SSID-filtered, so only matching points are
+//                            collected) and hands begin() the winner's channel+BSSID; the
+//                            result list is freed right after, but it is still an
+//                            allocation — mind a node already short on heap.
+//                            Picks by SIGNAL, and signal is not path quality: it will
+//                            happily choose a loud point whose uplink is broken.
 //
 //   Router ping watchdog (opt-in):
 //   PING_ROUTER              Router IP/host string — enables periodic TCP ping;
 //                            reboots after PING_ROUTER_MAX_FAILURES (default 4)
 //                            misses, every PING_ROUTER_INTERVAL ms (default 30000).
+//
+//   Gratuitous ARP (opt-in, default OFF):
+//   LIONWIFI_GARP_INTERVAL_MS  Broadcast an unsolicited "this IP is at this MAC"
+//                            ARP on every association and then every N ms
+//                            (0 = feature compiled out, the default). Cures the
+//                            case where a node re-associates to a DIFFERENT access
+//                            point and stays invisible to some peers for minutes:
+//                            the node's own traffic is unicast to the router, so it
+//                            only refreshes that one path, while the ARP caches of
+//                            other nodes and the forwarding tables of other points
+//                            keep pointing at the old radio. A broadcast reaches the
+//                            whole L2 domain at once. 120000 is a sane value; going
+//                            much below that just burns airtime (broadcasts go out
+//                            at the lowest basic rate and wake every client).
 //
 //   Logging / housekeeping (most gated by LionLogger features):
 //   LOG_CLEAR_EVERY_HOURS    Log-maintenance cadence (default 4)
@@ -78,9 +109,6 @@
 //                            second task that logs, and synchronous logging tolerates
 //                            exactly one. Enforced by #error further down.
 //   CORE_WIFI                FreeRTOS core for the WiFi task (default 1).
-//   WIFI_BEST_AP             Connect to the STRONGEST access point with the configured
-//                            SSID instead of the first one found (ESP32). Needed whenever
-//                            several points share an SSID — mesh, extender, second router.
 //   DISABLE_11N              Force 802.11b/g (some APs misbehave with 11n).
 //   WIFI_BW20                Force a 20 MHz channel (HT20) on the station link — steadier on
 //                            a weak or noisy one than the default 40 MHz.
@@ -224,6 +252,22 @@ extern "C"
 #define PING_ROUTER_MAX_FAILURES 4
 #endif
 
+// Gratuitous ARP. OFF by default: it costs airtime on every node that enables it,
+// and it only pays off where several access points share the SSID. See the flag
+// list at the top of this file.
+#ifndef LIONWIFI_GARP_INTERVAL_MS
+#define LIONWIFI_GARP_INTERVAL_MS 0ul
+#endif
+
+#if LIONWIFI_GARP_INTERVAL_MS > 0
+// etharp_gratuitous() builds an ARP request whose sender and target IP are both
+// ours — the standard "here I am" broadcast. Present in both cores' lwIP.
+#include <lwip/etharp.h>
+#ifdef ESP32
+#include <lwip/tcpip.h> // tcpip_callback: lwIP has its own task here, see SendGratuitousArp
+#endif
+#endif
+
 // Async responses that end in a reboot (/restart, successful /update) fire it from
 // onDisconnect, so the client actually receives the reply first. If the client never
 // closes the connection, this is how long Loop() waits before rebooting anyway —
@@ -318,6 +362,12 @@ private:
     int _routerPingSuccessesInRow = 0;
     uint32_t _lastRouterPingTime = 0;
 #endif
+#if LIONWIFI_GARP_INTERVAL_MS > 0
+    uint32_t _lastGarpTime = 0;
+    // Which access point we last announced ourselves on, to spot a silent roam.
+    uint8_t _lastBssid[6] = {0, 0, 0, 0, 0, 0};
+    int32_t _lastChannel = 0;
+#endif
     MyOta *_myOta = nullptr;
     Array<String *> _ssids, _passwords;
     int _curApIdx = 0;
@@ -371,6 +421,68 @@ private:
         _rebootAt = millis() + REBOOT_FALLBACK_MS;
         if (!_rebootAt)
             _rebootAt = 1; // millis() wrapped exactly onto 0 — keep "pending" truthy
+    }
+#endif
+
+#if LIONWIFI_GARP_INTERVAL_MS > 0
+    // Broadcast "our IP is at our MAC", unasked. Every ARP cache and every bridge
+    // forwarding table in the L2 domain then learns where we are NOW — which plain
+    // traffic does not achieve: ours is unicast to the router, so it refreshes that
+    // one path only, and a peer sitting behind another access point keeps sending
+    // to the radio we already left. One 42-byte frame, no allocation, no blocking.
+    // atAssociation: called from the connect path, where a "changed" access point is
+    // simply the one we just joined and must not be reported as a roam.
+    void SendGratuitousArp(bool atAssociation = false)
+    {
+        // Plain assignment: the caller's test is a (millis() - _lastGarpTime)
+        // difference, which survives the rollover on its own.
+        _lastGarpTime = millis();
+
+        // netif_default is the station interface in a station-only sketch, which is
+        // every sketch this library serves.
+#ifdef ESP32
+        // lwIP has its own task here, and calling etharp_* from ours corrupts its
+        // state. tcpip_callback hands the work over. NOTHING may log inside that
+        // callback — it runs in the tcpip task.
+        tcpip_callback([](void *)
+                       {
+            if (netif_default)
+                etharp_gratuitous(netif_default); },
+                       nullptr);
+#else
+        // No separate lwIP task on the ESP8266 — the whole Arduino core calls lwIP
+        // straight from loop().
+        if (netif_default)
+            etharp_gratuitous(netif_default);
+#endif
+
+        // Which point are we announcing ourselves on? The SDK re-associates on its own
+        // after a deauth and can land on a DIFFERENT BSSID carrying the same SSID without
+        // Connect() ever running — and if that reassociation beats one Loop() pass,
+        // _connected never flips, so not even "Connected to" appears. A silent roam is
+        // precisely the fault this feature exists for, so it must not go unrecorded, and
+        // this two-minute tick is the cheapest detector available.
+        //
+        // Logging follows the fleet's dedup rule: a bare tag while nothing changes, a full
+        // line when it does. (720 bare tags a day are ~10 KB; the full line is what one
+        // actually greps for afterwards.)
+        const uint8_t *bssid = WiFi.BSSID();
+        int32_t channel = WiFi.channel();
+        bool changed = !bssid || channel != _lastChannel || memcmp(bssid, _lastBssid, sizeof(_lastBssid)) != 0;
+        if (bssid)
+            memcpy(_lastBssid, bssid, sizeof(_lastBssid));
+        _lastChannel = channel;
+
+        if (atAssociation)
+            Logger.Log_P(ILogger::LvlInfo, PSTR("GARP armed on %02x:%02x:%02x:%02x:%02x:%02x ch %d, every %lums"),
+                         _lastBssid[0], _lastBssid[1], _lastBssid[2], _lastBssid[3], _lastBssid[4], _lastBssid[5],
+                         (int)channel, (unsigned long)LIONWIFI_GARP_INTERVAL_MS);
+        else if (changed)
+            Logger.Log_P(ILogger::LvlInfo, PSTR("GARP: AP CHANGED to %02x:%02x:%02x:%02x:%02x:%02x ch %d, RSSI %d"),
+                         _lastBssid[0], _lastBssid[1], _lastBssid[2], _lastBssid[3], _lastBssid[4], _lastBssid[5],
+                         (int)channel, (int)WiFi.RSSI());
+        else
+            Logger.Log_P(ILogger::LvlDebug, PSTR("GARP"));
     }
 #endif
 
@@ -1118,6 +1230,11 @@ private:
                     _myOta->Begin();
                     _otaStarted = true;
                 }
+#if LIONWIFI_GARP_INTERVAL_MS > 0
+                // The association is exactly the moment the network's idea of where
+                // we live goes stale — announce before anything else needs us.
+                SendGratuitousArp(true);
+#endif
                 if (_conEvent)
                     _conEvent();
             }
@@ -1154,6 +1271,15 @@ private:
 #else
             server.handleClient();
 #endif
+#endif
+#if LIONWIFI_GARP_INTERVAL_MS > 0
+            // Repeat while connected: the association-time announcement is lost on
+            // anything that reboots or flushes its tables afterwards, and a point
+            // that re-learns us wrongly (a client roaming past, a bridge aging out)
+            // has to be corrected before somebody actually needs us. Doubles as the
+            // silent-roam detector — see the logging at the end of SendGratuitousArp().
+            if (millis() - _lastGarpTime >= LIONWIFI_GARP_INTERVAL_MS)
+                SendGratuitousArp();
 #endif
 #ifdef PING_ROUTER
             if (millis() - _lastRouterPingTime > PING_ROUTER_INTERVAL)
@@ -1406,6 +1532,88 @@ protected:
             WiFi.setSleepMode(WIFI_NONE_SLEEP);
 #endif
     }
+
+#if defined(WIFI_BEST_AP) && !defined(ESP32)
+    // The ESP8266 core has no setScanMethod/setSortMethod — WiFi.begin() there always
+    // takes the first matching point the SDK stumbles over. So the choice has to be made
+    // by hand: scan every channel, keep the loudest match, and hand begin() the channel
+    // and BSSID it found. Returns false when the SSID is nowhere to be seen, and the
+    // caller then falls back to a plain begin() (better a coin toss than no association).
+    bool FindBestAp(const char *ssid, int32_t &channel, uint8_t *bssidOut)
+    {
+        // Blocking scan (~2 s, all channels). The SDK yields inside, so the watchdog is
+        // fed, but the sketch does stand still for it — the same price the ESP32 branch
+        // pays with WIFI_ALL_CHANNEL_SCAN, once per association attempt.
+        //
+        // The 4th argument is an SSID filter, handed straight to the SDK's scan_config:
+        // the sweep still covers every channel, but probes are directed and only matching
+        // points come back. Without it the result list holds every access point in the
+        // air — a neighbourhood's worth of them, all allocated on a 15 KB heap for
+        // nothing. (Stations never show up in a scan either way: nodes are clients, they
+        // send no beacons.)
+        int found = WiFi.scanNetworks(false, false, 0, (uint8 *)ssid);
+
+        // Read the entries through getNetworkInfo() rather than the WiFi.xxx(i) accessors.
+        // Not a style choice: ESP8266WiFiClass inherits channel() from BOTH the generic and
+        // the scan class and resolves the clash with `using ESP8266WiFiGenericClass::channel`
+        // alone (ESP8266WiFi.h) — so the scan-index form WiFi.channel(i) is not visible at
+        // all and does not compile. getNetworkInfo() hands over every field at once.
+        int best = -1;
+        int32_t bestRssi = 0;
+        for (int i = 0; i < found; i++)
+        {
+            String foundSsid;
+            uint8_t enc;
+            int32_t rssi, ch;
+            uint8_t *bssid = nullptr; // points into the scan results, valid until scanDelete()
+            bool hidden;
+            if (!WiFi.getNetworkInfo(i, foundSsid, enc, rssi, bssid, ch, hidden))
+                continue;
+            // The SSID test is redundant while the filter above works — but it is the only
+            // thing standing between a silently ignored filter and a stranger's access point.
+            if (foundSsid != ssid || (best >= 0 && rssi <= bestRssi))
+                continue;
+            best = i;
+            bestRssi = rssi;
+            channel = ch;
+            if (bssid)
+                memcpy(bssidOut, bssid, 6);
+        }
+
+        if (best >= 0)
+            Logger.Log_P(ILogger::LvlInfo, PSTR("Best AP for %s: ch %d, RSSI %d, %02x:%02x:%02x:%02x:%02x:%02x (%d with this SSID)"),
+                         ssid, (int)channel, (int)bestRssi,
+                         bssidOut[0], bssidOut[1], bssidOut[2], bssidOut[3], bssidOut[4], bssidOut[5], found);
+        else
+            Logger.Log_P(ILogger::LvlWarning, PSTR("No AP with SSID %s in scan — plain begin()"), ssid);
+
+        // Mandatory: the SDK holds the result list until told to drop it, and this runs on
+        // a node with ~15 KB of heap.
+        WiFi.scanDelete();
+        return best >= 0;
+    }
+#endif
+
+    // Single place where the association is actually started, so Connect() and Reconnect()
+    // cannot drift apart on which point they aim at.
+    void BeginStation()
+    {
+        const char *ssid = _ssids[_curApIdx]->c_str();
+        const char *pwd = _passwords[_curApIdx]->c_str();
+#if defined(WIFI_BEST_AP) && !defined(ESP32)
+        int32_t channel = 0;
+        uint8_t bssid[6];
+        // Pinning the BSSID binds this ONE attempt. If that point is gone, the attempt
+        // times out, the state machine calls Reconnect(), and the next scan picks again.
+        if (FindBestAp(ssid, channel, bssid))
+        {
+            WiFi.begin(ssid, pwd, channel, bssid, true);
+            return;
+        }
+#endif
+        WiFi.begin(ssid, pwd);
+    }
+
     void Connect()
     {
         _lastConnectStartTime = millis();
@@ -1423,7 +1631,7 @@ protected:
         // Never log the PSK — SSID only.
         Logger.Log_P(ILogger::LvlInfo, PSTR("Connecting to %s"), _ssids[_curApIdx]->c_str());
 #endif
-        WiFi.begin(_ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
+        BeginStation();
     }
     void Reconnect()
     {
@@ -1449,7 +1657,7 @@ protected:
         WiFi.persistent(false);
         WiFi.disconnect(true); // true = radio off; begin() below brings it back up
 #endif
-        WiFi.begin(_ssids[_curApIdx]->c_str(), _passwords[_curApIdx]->c_str());
+        BeginStation();
     }
     void Disconnect()
     {
