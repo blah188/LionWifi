@@ -12,11 +12,21 @@ struct DirEntry
 {
     // Max stored name length, excluding the NUL. Longer names are truncated in
     // listings — and a truncated name then breaks its tail/download/delete links.
-    // LittleFS and FAT/SD allow long names (SPIFFS itself caps at 31), so the
-    // default is generous. Override with -D LIONWIFI_NAME_MAX=N (costs N+1 bytes
-    // per listed entry; SD listings hold up to ~120 entries).
+    // Override with -D LIONWIFI_NAME_MAX=N (costs N+1 bytes per listed entry; SD
+    // listings hold up to ~120 entries).
+    //
+    // The default follows the filesystem, because on SPIFFS the extra bytes can
+    // never be used: SPIFFS caps object names at 31 characters, so a 64-byte buffer
+    // is half padding on every entry — and SPIFFS is what the small ESP8266 nodes
+    // run, exactly where a listing of 50 files costs real heap. LittleFS and FAT/SD
+    // do allow long names, so they keep the generous default; an SD build keeps it
+    // too even alongside SPIFFS, since the same struct lists both.
 #ifndef LIONWIFI_NAME_MAX
+#if defined(USE_SPIFFS) && !defined(USE_SD_CARD)
+#define LIONWIFI_NAME_MAX 31
+#else
 #define LIONWIFI_NAME_MAX 63
+#endif
 #endif
     const static int MaxSize = LIONWIFI_NAME_MAX;
     DirEntry(const char* name = NULL)

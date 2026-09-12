@@ -167,11 +167,19 @@ Override via `build_flags`. The full list lives in the header banner of
 | `PING_ROUTER` | off | Router IP/host → enable ping-and-reboot watchdog |
 | `WIFI_BEST_AP` | off | Associate with the **strongest** point carrying the SSID, not the first one found. For meshes/extenders/a second router; costs a channel sweep (~2 s) per association attempt |
 | `LIONWIFI_GARP_INTERVAL_MS` | `0` (off) | Broadcast a gratuitous ARP on association and every N ms, so the whole L2 domain learns which access point we are on. Also logs a silent roam. `120000` is a sane value |
+| `LIONWIFI_PREFERRED_AP_FILE` | `/wifi_ap.cfg` | Where the operator's preferred access point is stored (see `/aps`). Runtime choice, not a build flag — moving a node must not mean recompiling it |
+| `LIONWIFI_AP_SWITCH_DELAY_MS` | `500` | Grace period between answering `/aps/set` and actually re-associating, so the answer reaches the browser first |
+| `LIONWIFI_NO_AP_PAGE` | off | Drop `/aps` (the scan and ~2 KB of markup). The file, `/aps/set`, `/aps/clear` and the C++ API stay |
+| `LIONWIFI_NO_PREFERRED_AP` | off | Drop the file and the endpoints too (implies the above). Aiming at a BSSID via `SetPreferredAp()` is always compiled in |
+| `LIONWIFI_AP_NAMES` | off | Labels for access points, shown next to the BSSID on `/aps`, in the status line and in the connect/roam log lines. One string: `-D LIONWIFI_AP_NAMES=\"aa:bb:cc:dd:ee:ff=Hub;11:22:33:44:55:66=Main\"`. No spaces, no `;`/`=` inside names, ASCII. Lives in PROGMEM — no DRAM on the ESP8266 |
+| `NO_WIFI_BSSID_IN_STATUS` | off | Drop the `AP <bssid>` field from the status line |
+| `LIONWIFI_CLOCK_JUMP_SEC` | `30` | Warn when the wall clock moves on its own by more than this many seconds (uptime and clock are compared once a minute). `0` compiles it out |
 | `QUIET_WIFI_LOGS` | off | Suppress connect/reconnect log lines |
 | `NO_WIFI_TASK` (ESP32) | off | Run `Loop()` from your `loop()` instead of a task |
 | `NO_ASYNC_WEB_SERVER` (ESP32) | off | Use core `WebServer` instead of ESPAsyncWebServer |
 | `USE_SD_CARD` [+ `SDFAT`] | off | Also browse an SD card (SdFat with `SDFAT`) |
-| `LIONWIFI_NAME_MAX` | 63 | Max listed filename length (bytes); raise for long UTF-8 names |
+| `LIONWIFI_NAME_MAX` | 31 on SPIFFS w/o SD, else 63 | Max listed filename length (bytes). SPIFFS caps object names at 31, so a longer buffer is padding on every entry; raise for long LittleFS/SD names |
+| `LIONWIFI_LS_EXACT_ALLOC` | off | Count the directory first and allocate the listing array exactly once, instead of growing it by doubling (which keeps both buffers alive and roughly triples the peak). Costs a second directory walk — for heap-tight nodes |
 | `LIONWIFI_NO_ARDUINO_OTA` | off | Compile ArduinoOTA (espota) out — drops it and the mDNS responder it starts, ~34 KB of flash on ESP32. Use with `LIONWIFI_HTTP_OTA` |
 | `NO_MEMSTAT_IN_STATUS` | off | Drop heap/frag/stack stats from the status page (also the stack low-water tracking) |
 | `NO_WIFI_STAT_IN_STATUS` | off | Drop the WiFi RSSI/quality/channel line from the status page (shown by default) |
@@ -215,6 +223,46 @@ Copy-paste examples for all three (as `#define`s or `build_flags`) are in
 `/logout` · `/favicon.ico` · `/lion-tasks` (ESP8266). With `USE_SD_CARD`:
 `/sd/ls`, `/sd/tail/<f>`, `/sd/download/<f>`, `/sd/ren/<f>?to=<new>`,
 `/sd/del/<f>` (flat — no subfolders).
+
+### Preferred access point — `/aps`
+
+`/aps` scans and lists every point in the air (SSID, BSSID, channel, RSSI) and puts a
+**use** link on the rows that belong to a network this node is configured for. Where
+several points share one SSID, that is the only practical way to learn their BSSIDs —
+routers rarely show them, and the node is standing right there.
+
+| Endpoint | Does |
+|---|---|
+| `GET /aps` | The scan page (auth like everything else). Marks the point we are on now (`●`) and the preferred one (green) |
+| `GET /aps/set?bssid=<mac>[&n=<idx>\|&ssid=<name>]` | Prefer that point **and re-associate at once**. `n=` indexes the SSID list, `ssid=` names it, neither = the network in use. Answers plain text (the page calls it with `fetch` and stays on `/aps`); `400` with a reason on a bad MAC or index |
+| `GET /aps/clear` | Forget the preference (removes the file too) |
+
+Nothing links to `/aps` — this library renders no navigation — so add your own link if
+you want one, or drive `SetPreferredAp()` / `ClearPreferredAp()` / `GetPreferredAp()`
+from your own settings page.
+
+The feature comes in three levels, because the parts cost very different amounts.
+**Aiming an association at a BSSID is always compiled in** — empty by default, and an
+empty preference behaves exactly as if the feature did not exist, so a consumer can point
+it somewhere from its own config without any flag. `LIONWIFI_NO_AP_PAGE` drops `/aps`
+alone (the scan and ~2 KB of markup — the expensive part), keeping the file and the
+endpoints. `LIONWIFI_NO_PREFERRED_AP` drops those as well and leaves only the in-RAM
+aiming; note that without the file a choice lives until the next reboot, and without the
+endpoints nothing re-associates to verify it.
+
+Two things worth knowing. The scan is **asynchronous**, so a visit takes two loads: the
+first starts it and the page reloads itself four seconds later, the second shows the list
+and frees it (which is why every visit scans afresh). It has to be asynchronous — a
+blocking scan inside an async request handler runs in the AsyncTCP task and resets the
+node. The station still goes off-channel for the sweep, so traffic stalls either way:
+open the page by hand, do not poll it. And choosing a point
+**re-associates immediately** — the link drops for a few seconds, and that is deliberate:
+a BSSID clicked by mistake fails while somebody is watching instead of days later at the
+next reconnect. The page calls the endpoint with `fetch`, so the address stays on `/aps`,
+and reloads itself five seconds later; if the node needs longer than that, refresh once
+more. An attempt aimed at a point that does not answer falls back to the normal rule and
+is retried after the next successful connect, so a point that has gone away costs one
+timeout, not every retry.
 
 ## SD cards
 

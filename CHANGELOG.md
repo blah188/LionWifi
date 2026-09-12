@@ -6,6 +6,91 @@ All notable changes to LionWifi are documented here. Format loosely follows
 ## 1.6.0 — 2026-09-11
 
 ### Added
+- **Three levels, so nobody pays for what they do not use.** Aiming an association at a
+  given BSSID is **always compiled in**: empty by default, and an empty preference behaves
+  exactly as if the feature were absent, so it costs a few bytes and no flag.
+  `LIONWIFI_NO_AP_PAGE` drops `/aps` alone — the scan and ~2 KB of markup, the expensive
+  part — while the file, `/aps/set`, `/aps/clear` and the C++ API stay, so the choice keeps
+  working from outside. `LIONWIFI_NO_PREFERRED_AP` drops those too (and implies the first
+  flag), leaving only the in-RAM aiming: without the file a choice lives until the next
+  reboot, and without the endpoints nothing re-associates to verify it.
+- **A preferred access point, chosen at runtime** — `/aps` plus
+  `GetPreferredAp()`/`SetPreferredAp()`/`ClearPreferredAp()`, stored in
+  `LIONWIFI_PREFERRED_AP_FILE` (`/wifi_ap.cfg`, two text lines: SSID then BSSID).
+  `WIFI_BEST_AP` picks by signal, and signal is not path quality: an extender two metres
+  away is loud but relays everything over a backhaul that can be far worse than a router
+  heard at -60. Which box sits next to what is knowledge the operator has and the node
+  cannot infer, so the choice is theirs. Runtime and not a build flag on purpose — moving
+  a node must not mean recompiling it.
+  The BSSID is stored **with its SSID**: this class rotates through a list of networks,
+  and a BSSID means nothing on a network the node never joins.
+  A pinned attempt that times out **disarms** the preference (falling back to the usual
+  rule) until the next successful connect re-arms it, so a point that has gone away costs
+  one timeout rather than one per retry. The stored choice is never rewritten by the
+  library: landing elsewhere because the preferred point was unreachable does not make
+  the substitute the operator's choice. Pinning passes channel 0 and lets the SDK find
+  the BSSID, so a router that changed channel does not turn the choice into a dud.
+  Setting a preference **re-associates at once** rather than waiting for the next
+  reconnect: a BSSID clicked or typed by mistake then fails while somebody is watching,
+  instead of sitting in the file for days and failing where nobody is. The move is
+  deferred to `Loop()` — doing it inside the request handler would kill the response
+  before it is written and, on the async server, touch the WiFi stack from the AsyncTCP
+  task. The station is disconnected explicitly first: without that the SDK can keep
+  reporting `WL_CONNECTED` for the old association for a moment, and the loop would
+  announce the OLD access point as the result of the move.
+  The endpoint answers **plain text**, and the page calls it with `fetch` rather than
+  navigating to it: the address stays on `/aps` instead of stranding the browser on a dead
+  `/aps/set?...` once the link drops. The page then reloads itself five seconds later.
+  `LIONWIFI_AP_SWITCH_DELAY_MS` (500) holds the move off just long enough for that answer
+  to be written, which on the async server is not otherwise guaranteed — there the handler
+  only queues the response.
+- **`/aps`** — scan page listing every point in the air (SSID, BSSID, channel, RSSI),
+  marking the one we are associated to right now (`●`, also spelled out above the table
+  with its RSSI and channel) and the preferred one (green row) — two different questions,
+  since an association can perfectly well have landed somewhere other than the preference.
+  The scan is **asynchronous**, and that is not a nicety: a blocking scan stands for ~2 s,
+  and on the async server the handler runs in the AsyncTCP task — block there and the
+  connection times out underneath it, the request object is freed, and the send that
+  follows writes into dead memory. Opening `/aps` reset an ESP32 that way (SW_CPU_RESET)
+  before this was fixed. `scanNetworks(true)` only asks the driver to start, so a visit
+  costs two loads: the first kicks the scan and the page reloads itself, the second
+  renders and frees the list — which also makes every visit scan afresh instead of showing
+  an hour-old one, and keeps no stale result list on a node with ~15 KB of heap.
+  A "use" link sits on rows belonging to a configured network, and `/aps/set` + `/aps/clear`
+  documented as endpoints so a consumer can drive them from its own UI. Nothing links to
+  the page (this library renders no navigation). Where several points share an SSID this
+  is the only practical way to learn their BSSIDs — routers rarely show them. The scan
+  blocks ~2 s with the station off-channel, so traffic stalls for it: a page to open by
+  hand, not to poll.
+- **`LIONWIFI_CLOCK_JUMP_SEC`** (default 30 s, `0` compiles it out) — warn when the wall
+  clock moves on its own. Uptime and clock are sampled together once a minute and must
+  advance by the same amount; when they do not, the log gets
+  `CLOCK JUMPED -74 s (uptime +60s, clock +-14s) now 08:59:50`.
+
+  Worth a permanent watch because it happened and nothing noticed. A node lost 74 minutes
+  for about three hours and then got them back, while its uptime ran evenly throughout. In
+  its own log this looked like timestamps running BACKWARDS mid-file (08:05 followed by
+  07:45) and was only pinned down by comparing against another node's log, where the same
+  command appeared 74 minutes later — the `millis()` values embedded in a few lines were
+  the only honest ruler available. Two nodes can drift an hour apart with no line anywhere
+  saying so, which also quietly ruins any attempt to correlate logs across a fleet.
+  The check starts only after time is set: before that the clock sits at the epoch and the
+  first NTP answer is a jump by design.
+- **`LIONWIFI_AP_NAMES`** — human labels for access points, shown **next to** the BSSID
+  (never instead of it) on `/aps`, in the status line and in the connect and roam log
+  lines, which is where a MAC reads worst and a name pays off most. The whole map is one
+  build flag, one string: `-D LIONWIFI_AP_NAMES=\"aa:bb:cc:dd:ee:ff=Hub;11:22:...=Main\"`;
+  undefined compiles the lookup out entirely. A single literal rather than a table of
+  pairs for two reasons: it needs exactly one `\"...\"`, the quoting shape that survives
+  scons on Windows (braces and nested quotes in a `-D` do not), and it lands in PROGMEM as
+  ONE array, so on the ESP8266 it costs no DRAM — a pointer table would have to be in
+  PROGMEM too, read back through `pgm_read_ptr`, for the same result and more code.
+  Names carry no spaces (`build_flags` are split on whitespace), no `;` or `=`, ASCII
+  only. Matching is on the full six bytes, the same thing an association is pinned by.
+- **BSSID in the status line** (`AP aa:bb:cc:dd:ee:ff`), suppressed by
+  `NO_WIFI_BSSID_IN_STATUS`. RSSI alone cannot distinguish "the near point is weak today"
+  from "we are back on the far one", and that difference is the usual reason a node is
+  slow or unreachable.
 - **`WIFI_BEST_AP` now works on the ESP8266 too** (still off by default, on both cores).
   That core has no `setScanMethod`/`setSortMethod`, so the ESP32 trick of asking the stack
   for an all-channel scan is unavailable: the library now scans itself before each
@@ -38,9 +123,26 @@ All notable changes to LionWifi are documented here. Format loosely follows
   which makes it a **silent-roam detector**: the SDK re-associates by itself after a deauth
   and can land on a different point carrying the same SSID without `Connect()` running at
   all — and when that beats one `Loop()` pass, `_connected` never flips, so not even the
-  "Connected to" line appears. Logging follows the usual dedup rule: `GARP` (debug) while
-  nothing changes, `GARP: AP CHANGED to <bssid> ch N, RSSI x` (info) when it does, and
-  `GARP armed on <bssid> ch N, every Nms` on association.
+  "Connected to" line appears. Only EVENTS are logged — `GARP armed on <bssid> ch N,
+  every Nms` at association and `GARP: AP CHANGED to <bssid> ch N, RSSI x` on a roam. The
+  steady tick stays silent: a bare `GARP` line 720 times a day said nothing and buried the
+  one line worth grepping for, and the "armed" line already proves the feature is running.
+
+### Changed
+- **`LIONWIFI_NAME_MAX` now follows the filesystem: 31 on SPIFFS without SD, 63 otherwise**
+  (was always 63). SPIFFS caps object names at 31 characters, so on a SPIFFS node the rest
+  of that buffer can never be filled — it was half padding on every listed entry, and
+  SPIFFS is what the small ESP8266 nodes run, exactly where a listing costs real heap.
+  `DirEntry` drops from 76 to 44 bytes per file. LittleFS and SD keep 63, and an SD build
+  keeps it even alongside SPIFFS, since the same struct lists both. Override as before.
+- **`LIONWIFI_LS_EXACT_ALLOC`** (opt-in) — count the directory, then allocate the entry
+  array exactly once. `Array` grows by doubling and keeps BOTH buffers alive during a
+  growth (`new[]` → `memcpy` → `delete[]`), so the step from 32 to 64 entries peaks at 96
+  entries' worth rather than 64. Measured on a hub, `/spiffs/ls` took free heap from
+  10816 down to 2608 bytes — enough to make the page flaky on a node that lives at ~10 KB.
+  With both changes a 50-file listing needs one allocation of 2200 bytes instead of a
+  7296-byte peak. Off by default because it walks the directory twice: a page opened by
+  hand can afford that, a hot path could not.
 
 ## 1.5.0 — 2026-09-10
 

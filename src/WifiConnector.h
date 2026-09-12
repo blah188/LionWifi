@@ -61,6 +61,54 @@
 //                            Picks by SIGNAL, and signal is not path quality: it will
 //                            happily choose a loud point whose uplink is broken.
 //
+//   Preferred access point (runtime, no flag needed to enable):
+//   LIONWIFI_PREFERRED_AP_FILE  Where the operator's choice of access point lives
+//                            (default "/wifi_ap.cfg"): two text lines, SSID then
+//                            BSSID. Nothing is preferred until something is stored,
+//                            so the cost is one absent-file check at boot.
+//                            WHY a choice at all: where several points share an SSID,
+//                            signal is not path quality — an extender two metres away
+//                            is loud but relays over a backhaul that may be far worse
+//                            than a router heard at -60. Which box sits next to what
+//                            is knowledge the operator has and the node cannot infer.
+//                            Runtime, not a build flag: moving a node must not mean
+//                            recompiling it. Set it from /aps, from the endpoints
+//                            below, or from the consumer's own UI via
+//                            SetPreferredAp()/ClearPreferredAp()/GetPreferredAp().
+//                            Setting one re-associates immediately, so a mistake shows
+//                            up while somebody is watching instead of days later.
+//                            A pinned attempt that times out disarms the preference
+//                            until the next successful connect, so a point that has
+//                            gone away costs ONE timeout rather than every retry; the
+//                            stored choice itself is never rewritten by the library.
+//   LIONWIFI_NO_AP_PAGE      Drop /aps — the scan and ~2 KB of markup, the expensive
+//                            part. The file, /aps/set, /aps/clear and the C++ API stay,
+//                            so the choice keeps working and is driven from outside.
+//   LIONWIFI_NO_PREFERRED_AP Drop all of the above AND the file and the endpoints
+//                            (implies LIONWIFI_NO_AP_PAGE). What survives is aiming an
+//                            association at a BSSID given through SetPreferredAp() —
+//                            always compiled, since an empty preference costs a few
+//                            bytes and behaves exactly like no feature at all.
+//   LIONWIFI_AP_NAMES        Human labels for access points, shown next to the BSSID
+//                            (never instead of it) on /aps, in the status line and in
+//                            the connect/roam log lines. ONE string, one build flag:
+//                              -D LIONWIFI_AP_NAMES=\"aa:bb:cc:dd:ee:ff=Hub;11:22:...=Main\"
+//                            Undefined = the whole lookup is compiled out.
+//                            A single literal on purpose: it needs exactly one \"...\",
+//                            the quoting shape that survives scons on Windows, and lands
+//                            in PROGMEM as ONE array, so on the ESP8266 it costs no DRAM.
+//                            Names carry no spaces (build_flags are split on whitespace),
+//                            no ';' or '=', and ASCII only. Matching is on the full six
+//                            bytes — the same thing we associate by.
+//   NO_WIFI_BSSID_IN_STATUS  Drop the "AP <bssid>" field from the status line.
+//   LIONWIFI_CLOCK_JUMP_SEC  Report a wall clock that moved on its own (default 30 s,
+//                            0 = compiled out). Uptime and clock are sampled together
+//                            once a minute and must advance by the same amount; they did
+//                            not, once, and nothing noticed — a node lost 74 minutes for
+//                            three hours and got them back, its own log showing
+//                            timestamps running BACKWARDS mid-file. Logs a warning:
+//                            "CLOCK JUMPED -74 s (uptime +60s, clock +-14s) now 08:59:50".
+//
 //   Router ping watchdog (opt-in):
 //   PING_ROUTER              Router IP/host string — enables periodic TCP ping;
 //                            reboots after PING_ROUTER_MAX_FAILURES (default 4)
@@ -120,8 +168,16 @@
 //   FsBrowser extras:
 //   USE_SD_CARD [+ SDFAT]    Also browse an SD card (SdFat when SDFAT is set).
 //   USE_FILE_TIME            Show created/modified timestamps in listings.
-//   LIONWIFI_NAME_MAX        Max listed filename length (default 63); raise for
-//                            longer LittleFS/SD names (costs N+1 bytes/entry).
+//   LIONWIFI_NAME_MAX        Max listed filename length (costs N+1 bytes/entry).
+//                            Default follows the filesystem: 31 on SPIFFS without SD
+//                            (SPIFFS caps object names at 31, so more is padding on
+//                            every entry), 63 otherwise. Raise for long LittleFS/SD names.
+//   LIONWIFI_LS_EXACT_ALLOC  Count the directory before listing it and allocate the
+//                            entry array exactly once (default off). The array grows by
+//                            doubling and keeps BOTH buffers alive during a growth, so a
+//                            50-file listing peaks at ~96 entries' worth — enough to make
+//                            /spiffs/ls flaky on an ESP8266 with ~10 KB free. Costs a
+//                            second directory walk; worth it only where heap is tight.
 //
 // ---- HTTP endpoints registered (see FsBrowser::AddRoutes + WifiConnector::Setup):
 //   GET /                         Home page (index.html w/ SD, else index_nosd.html)
@@ -132,6 +188,37 @@
 //                                 (full / last 8 KB). Added by WifiConnector::Setup,
 //                                 served via FsBrowser from Logger.GetLogFileName().
 //   GET /restart                  Reboot the device
+//   GET /aps                      Scan and list every access point in the air (SSID,
+//                                 BSSID, channel, RSSI), marking the one we are on now
+//                                 and the preferred one, with a "use" link on the rows
+//                                 belonging to a network this node is configured for.
+//                                 The scan is ASYNCHRONOUS and so a visit costs two
+//                                 loads: the first kicks it and the page reloads itself,
+//                                 the second renders and frees the list. It must be — a
+//                                 blocking scan inside an async handler runs in the
+//                                 AsyncTCP task and resets the node. The station is still
+//                                 off-channel for the sweep, so traffic stalls either
+//                                 way: a page to open by hand, not to poll. Nothing links
+//                                 to it (this library renders no navigation); add your
+//                                 own link if you want one.
+//   GET /aps/set?bssid=<mac>      Prefer that access point AND re-associate at once, so
+//                                 the choice is verified rather than trusted: the link
+//                                 drops for a second or two (the caller's own connection
+//                                 with it). The re-association is deferred to Loop() and
+//                                 to LIONWIFI_AP_SWITCH_DELAY_MS after the answer —
+//                                 doing it in the handler would kill the response and,
+//                                 on the async server, touch WiFi from the AsyncTCP task.
+//                                 Answers plain text: the page calls this with fetch()
+//                                 and stays on /aps (a link would strand the browser on
+//                                 a dead address once the link drops), and a caller of
+//                                 its own gets something trivial to check.
+//       [&n=<idx> | &ssid=<name>] Which of the configured networks it belongs to: n= is
+//                                 an index into the SSID list (what the page sends — no
+//                                 escaping, and it cannot name a network we lack), ssid=
+//                                 names it outright, and with neither the network
+//                                 currently in use is meant. Redirects to /aps; answers
+//                                 400 with a reason when the MAC or the index is bad.
+//   GET /aps/clear                Forget the preference (also removes the file).
 //   GET/POST /update              Sketch or FS-image upload + reboot (with -D LIONWIFI_HTTP_OTA)
 //   GET /format                   Format the FS (ESP8266 / ESP32-sync only)
 //   GET /logout                   Clear HTTP Basic auth (401)
@@ -268,6 +355,67 @@ extern "C"
 #endif
 #endif
 
+// Preferred access point. Where several points carry one SSID, RSSI alone is a poor
+// judge: an extender two metres away is loud but relays everything over a backhaul that
+// may be far worse than a router heard at -60. Who stands next to what is knowledge the
+// operator has and the node cannot infer, so the choice is theirs — stored at RUNTIME
+// (a build flag would mean recompiling a node to move it), in this file on the FS.
+//
+// Nothing is preferred until something is stored, so the feature costs one absent-file
+// check at boot and is otherwise invisible.
+// Three levels, because the parts cost very different amounts:
+//
+//   always compiled   aiming an association at a given BSSID. Empty by default, and an
+//                     empty preference changes nothing — the node associates exactly as
+//                     it did before. A few bytes of state; a consumer can point it
+//                     somewhere with SetPreferredAp() and needs no flag to do so.
+//   LIONWIFI_NO_PREFERRED_AP   drops the rest: the file, the /aps/set and /aps/clear
+//                     endpoints, and (implying the flag below) the page. What is left is
+//                     the in-RAM ability above.
+//   LIONWIFI_NO_AP_PAGE        drops only /aps — the scan and ~2 KB of markup, the
+//                     expensive part — while the file and the endpoints stay, so the
+//                     choice keeps working and is driven from outside.
+#ifdef LIONWIFI_NO_PREFERRED_AP
+#ifndef LIONWIFI_NO_AP_PAGE
+#define LIONWIFI_NO_AP_PAGE // no storage means nothing for the page to show or set
+#endif
+#endif
+
+#ifndef LIONWIFI_PREFERRED_AP_FILE
+#define LIONWIFI_PREFERRED_AP_FILE "/wifi_ap.cfg"
+#endif
+
+// Clock-jump watch: how many seconds the wall clock may disagree with uptime before it is
+// reported. 0 compiles the whole thing out.
+//
+// The pair (millis(), time()) is sampled once a minute; between two samples both must
+// advance by the same amount. A difference means the wall clock moved on its own — an NTP
+// answer that was accepted and should not have been, or time lost some other way.
+//
+// Why it is worth a permanent watch: it happened, and nothing noticed. A window-opener
+// node lost 74 minutes for about three hours and then got them back, while its uptime ran
+// evenly the whole time. In its own log this looked like timestamps going BACKWARDS
+// mid-file (08:05 followed by 07:45) and was only pinned down by comparing against
+// another node's log, where the same command was logged 74 minutes later. Two nodes can
+// drift an hour apart and no line anywhere says so — which also quietly ruins any attempt
+// to correlate logs across the fleet.
+//
+// 30 s is comfortably above a normal SNTP correction (single-digit seconds) and far below
+// anything worth investigating.
+#ifndef LIONWIFI_CLOCK_JUMP_SEC
+#define LIONWIFI_CLOCK_JUMP_SEC 30
+#endif
+
+// Grace period between answering /aps/set and actually re-associating. The answer must
+// reach the browser first: on the async server it is only QUEUED when the handler
+// returns, and tearing the station down before the AsyncTCP task has written it would
+// leave the caller with a dead socket and no idea what happened. Enough for a few dozen
+// bytes to be written and no more — the page's own wait for the node starts ticking the
+// moment it gets this answer, so anything spent here comes out of that budget.
+#ifndef LIONWIFI_AP_SWITCH_DELAY_MS
+#define LIONWIFI_AP_SWITCH_DELAY_MS 500ul
+#endif
+
 // Async responses that end in a reboot (/restart, successful /update) fire it from
 // onDisconnect, so the client actually receives the reply first. If the client never
 // closes the connection, this is how long Loop() waits before rebooting anyway —
@@ -354,6 +502,13 @@ private:
 #ifdef FS_LOW_SPACE_THRESHOLD
     uint32_t _lastFreeSpaceCheck = 0;
 #endif
+#if LIONWIFI_CLOCK_JUMP_SEC > 0
+    // Last (uptime, wall clock) pair. Both must advance together; see the macro comment.
+    // NOT inside the #ifndef ESP32 below: the check itself runs on every platform, and
+    // hiding the fields in a platform block breaks exactly the builds it does not cover.
+    uint32_t _clockSampleMs = 0;
+    time_t _clockSampleTime = 0;
+#endif
 #ifndef ESP32
     uint32_t _lastHeapCheckTime = 0;
 #endif
@@ -367,6 +522,30 @@ private:
     // Which access point we last announced ourselves on, to spot a silent roam.
     uint8_t _lastBssid[6] = {0, 0, 0, 0, 0, 0};
     int32_t _lastChannel = 0;
+#endif
+
+    // Preferred access point. Always compiled: empty by default, and empty means the node
+    // associates exactly as it always did.
+    // The SSID is kept WITH the BSSID: this class rotates through a list of networks
+    // (_ssids/_curApIdx), and a BSSID belongs to exactly one of them — pinning it while
+    // joining another network would quietly break that association.
+    uint8_t _prefBssid[6] = {0, 0, 0, 0, 0, 0};
+    String _prefSsid;
+    bool _prefStored = false; // a preference exists at all
+    // Armed = try the preferred point on the next association. Disarmed by a failed
+    // attempt that used it, re-armed by any successful connect, so a point that went
+    // away costs one timeout and not every retry from then on. The BSSID itself is
+    // never touched by this: the operator's choice outlives the outage.
+    bool _prefArmed = true;
+    bool _prefPinned = false; // the attempt now running is aimed at the preferred point
+#ifndef LIONWIFI_NO_PREFERRED_AP
+    bool _prefLoaded = false; // the file has been read (lazily, see BeginStation)
+    // A new choice asks for an immediate re-association, but NOT from the request
+    // handler: on the async server that handler runs in the AsyncTCP task, and tearing
+    // the station down from there would both kill the response before it is written and
+    // touch the WiFi stack from the wrong task. Loop() picks this up instead, once the
+    // grace period has let the answer out. 0 = nothing pending.
+    uint32_t _reconnectAt = 0;
 #endif
     MyOta *_myOta = nullptr;
     Array<String *> _ssids, _passwords;
@@ -463,9 +642,10 @@ private:
         // precisely the fault this feature exists for, so it must not go unrecorded, and
         // this two-minute tick is the cheapest detector available.
         //
-        // Logging follows the fleet's dedup rule: a bare tag while nothing changes, a full
-        // line when it does. (720 bare tags a day are ~10 KB; the full line is what one
-        // actually greps for afterwards.)
+        // Only EVENTS are logged: armed, and the roam this exists to catch. The steady
+        // tick says nothing — 720 bare "GARP" lines a day are ~10 KB of noise in the very
+        // log one greps for the interesting line, and the feature being alive is already
+        // evidenced by the "armed" line at association.
         const uint8_t *bssid = WiFi.BSSID();
         int32_t channel = WiFi.channel();
         bool changed = !bssid || channel != _lastChannel || memcmp(bssid, _lastBssid, sizeof(_lastBssid)) != 0;
@@ -473,16 +653,15 @@ private:
             memcpy(_lastBssid, bssid, sizeof(_lastBssid));
         _lastChannel = channel;
 
+        char mac[18], nm[26];
+        FormatBssid(_lastBssid, mac);
+        ApNameSuffix(_lastBssid, nm, sizeof(nm)); // "" unless the point is labelled
         if (atAssociation)
-            Logger.Log_P(ILogger::LvlInfo, PSTR("GARP armed on %02x:%02x:%02x:%02x:%02x:%02x ch %d, every %lums"),
-                         _lastBssid[0], _lastBssid[1], _lastBssid[2], _lastBssid[3], _lastBssid[4], _lastBssid[5],
-                         (int)channel, (unsigned long)LIONWIFI_GARP_INTERVAL_MS);
+            Logger.Log_P(ILogger::LvlInfo, PSTR("GARP armed on %s%s ch %d, every %lums"),
+                         mac, nm, (int)channel, (unsigned long)LIONWIFI_GARP_INTERVAL_MS);
         else if (changed)
-            Logger.Log_P(ILogger::LvlInfo, PSTR("GARP: AP CHANGED to %02x:%02x:%02x:%02x:%02x:%02x ch %d, RSSI %d"),
-                         _lastBssid[0], _lastBssid[1], _lastBssid[2], _lastBssid[3], _lastBssid[4], _lastBssid[5],
-                         (int)channel, (int)WiFi.RSSI());
-        else
-            Logger.Log_P(ILogger::LvlDebug, PSTR("GARP"));
+            Logger.Log_P(ILogger::LvlInfo, PSTR("GARP: AP CHANGED to %s%s ch %d, RSSI %d"),
+                         mac, nm, (int)channel, (int)WiFi.RSSI());
     }
 #endif
 
@@ -494,6 +673,156 @@ public:
     bool Connected() { return _connected; }
     bool TimeSet() { return _timeSet; }
     FsBrowser *Browser() { return _fsBrowser; }
+
+    // ---- preferred access point ------------------------------------------------------
+    // The /aps page drives these, and so can the consumer: a node with its own settings
+    // UI can offer the choice there instead, or seed it from its own config.
+
+    // The stored choice, or false when there is none. bssid may be nullptr.
+    bool GetPreferredAp(String &ssid, uint8_t *bssid) const
+    {
+        if (!_prefStored)
+            return false;
+        ssid = _prefSsid;
+        if (bssid)
+            memcpy(bssid, _prefBssid, 6);
+        return true;
+    }
+
+    // Store and persist. The SSID is kept alongside because the BSSID only means
+    // anything on that network (see the field comment). Takes effect at the NEXT
+    // association — the point of this is which AP to join, not to leave the current one.
+    bool SetPreferredAp(const char *ssid, const uint8_t *bssid)
+    {
+        if (!ssid || !*ssid || !bssid)
+            return false;
+        _prefSsid = ssid;
+        memcpy(_prefBssid, bssid, 6);
+        _prefStored = true;
+        _prefArmed = true; // a freshly made choice always deserves one attempt
+#ifdef LIONWIFI_NO_PREFERRED_AP
+        // Storage compiled out: the choice lives until the next reboot, which is all a
+        // consumer that sets it from its own config needs — it will set it again anyway.
+        return true;
+#else
+        return SavePreferredAp();
+#endif
+    }
+
+    // Forget it, on the filesystem too. Associations go back to the default behaviour.
+    bool ClearPreferredAp()
+    {
+        _prefStored = false;
+        _prefArmed = true;
+        _prefSsid = "";
+        memset(_prefBssid, 0, 6);
+#ifndef LIONWIFI_NO_PREFERRED_AP
+        LIONWIFI_FS.remove(F(LIONWIFI_PREFERRED_AP_FILE)); // absent is not an error
+#endif
+        Logger.Log_P(ILogger::LvlInfo, PSTR("Preferred AP cleared"));
+        return true;
+    }
+
+    // 6 bytes -> "aa:bb:cc:dd:ee:ff". out must hold 18 bytes.
+    static void FormatBssid(const uint8_t *b, char *out)
+    {
+        snprintf_P(out, 18, PSTR("%02x:%02x:%02x:%02x:%02x:%02x"),
+                   b[0], b[1], b[2], b[3], b[4], b[5]);
+    }
+
+    // Human label for an access point, from LIONWIFI_AP_NAMES. false = not listed (and
+    // out is emptied), which is also what a build without the flag always answers.
+    //
+    // The whole map is ONE build flag, one string:
+    //   -D LIONWIFI_AP_NAMES=\"d6:9c:53:2e:39:09=Hub;50:ff:20:bd:d1:e9=Main\"
+    // Deliberately not a table of pairs: a single literal needs exactly one \"...\" — the
+    // quoting shape that survives scons on Windows — and lands in PROGMEM as ONE array,
+    // so on the ESP8266 it costs no DRAM at all. A table would need the pointers in
+    // PROGMEM too, read through pgm_read_ptr, for the same result and more code.
+    // Names carry no spaces (build_flags are split on whitespace) and no ';' or '='.
+    static bool ApNameFor(const uint8_t *bssid, char *out, size_t outLen)
+    {
+        if (!out || outLen < 2)
+            return false;
+        out[0] = 0;
+#ifdef LIONWIFI_AP_NAMES
+        if (!bssid)
+            return false;
+        // Function-local so the string exists once, whoever includes this header.
+        static const char names[] PROGMEM = LIONWIFI_AP_NAMES;
+        char mac[18];
+        FormatBssid(bssid, mac); // lowercase hex, which is what we compare against
+
+        const size_t n = strlen_P(names);
+        size_t i = 0;
+        while (i < n)
+        {
+            // One entry is "<17 chars of MAC>=<name>", entries separated by ';'.
+            const size_t start = i;
+            size_t eq = 0;
+            while (i < n && (char)pgm_read_byte(names + i) != ';')
+            {
+                if (!eq && (char)pgm_read_byte(names + i) == '=')
+                    eq = i;
+                i++;
+            }
+            const size_t end = i;
+            if (i < n)
+                i++; // step over the ';'
+            if (!eq || eq - start != 17)
+                continue; // not "mac=name" — ignore rather than guess
+
+            bool same = true;
+            for (size_t k = 0; k < 17 && same; k++)
+            {
+                char c = (char)pgm_read_byte(names + start + k);
+                same = tolower((unsigned char)c) == mac[k];
+            }
+            if (!same)
+                continue;
+
+            size_t k = 0;
+            for (size_t p = eq + 1; p < end && k + 1 < outLen; p++)
+                out[k++] = (char)pgm_read_byte(names + p);
+            out[k] = 0;
+            return k > 0;
+        }
+#else
+        (void)bssid;
+#endif
+        return false;
+    }
+
+    // " (Name)" for appending to a line, or "" when the point has no label. Keeps the
+    // callers free of conditionals: they print %s and get nothing when there is nothing.
+    static void ApNameSuffix(const uint8_t *bssid, char *out, size_t outLen)
+    {
+        char name[24];
+        if (ApNameFor(bssid, name, sizeof(name)))
+            snprintf_P(out, outLen, PSTR(" (%s)"), name);
+        else if (outLen)
+            out[0] = 0;
+    }
+
+    // "aa:bb:cc:dd:ee:ff" -> 6 bytes. Separators are optional and may be ':' or '-',
+    // so both a pasted scan row and a hand-typed MAC parse. false = not a MAC.
+    static bool ParseBssid(const char *text, uint8_t *out)
+    {
+        if (!text || !out)
+            return false;
+        int n = 0;
+        for (const char *p = text; *p && n < 6; p++)
+        {
+            if (*p == ':' || *p == '-')
+                continue;
+            if (!isxdigit((unsigned char)p[0]) || !isxdigit((unsigned char)p[1]))
+                return false;
+            char pair[3] = {p[0], p[1], 0};
+            out[n++] = (uint8_t)strtoul(pair, nullptr, 16);
+            p++; // the loop increment eats the second digit
+        }
+        return n == 6;
+    }
 #ifdef PING_ROUTER
     int GetRouterPingErrorsInRow() { return _routerPingErrorsInRow; }
     int GetRouterPingSuccessesInRow() { return _routerPingSuccessesInRow; }
@@ -837,8 +1166,20 @@ public:
             else if (rssi >= -75) { rq = F("ok");              rcolor = "green"; }
             else if (rssi >= -82) { rq = F("weak, OTA slow");  rcolor = "orange"; }
             else                  { rq = F("POOR, OTA fails"); rcolor = "red"; }
-            out.printf_P(PSTR("<div class='global-status wifi-status'><span>WiFi <b>%s</b></span>&nbsp;<span>RSSI <b>%d</b> dBm &mdash; <b style='color:%s'>%S</b></span>&nbsp;<span>ch <b>%d</b></span></div>"),
+            out.printf_P(PSTR("<div class='global-status wifi-status'><span>WiFi <b>%s</b></span>&nbsp;<span>RSSI <b>%d</b> dBm &mdash; <b style='color:%s'>%S</b></span>&nbsp;<span>ch <b>%d</b></span>"),
                          WiFi.SSID().c_str(), rssi, rcolor, rq, WiFi.channel());
+#ifndef NO_WIFI_BSSID_IN_STATUS
+            // WHICH point, not just how loud. Where several share the SSID, the RSSI alone
+            // cannot tell "the near one is weak today" from "we are on the far one again",
+            // and that difference is the usual cause of a node that is slow or unreachable.
+            {
+                char mac[18], nm[26];
+                FormatBssid(WiFi.BSSID(), mac);
+                ApNameSuffix(WiFi.BSSID(), nm, sizeof(nm));
+                out.printf_P(PSTR("&nbsp;<span>AP <b>%s</b>%s</span>"), mac, nm);
+            }
+#endif
+            out.print(F("</div>"));
         }
 #endif
     }
@@ -865,15 +1206,17 @@ public:
                 if (_otaEndEvent) _otaEndEvent(ok);
                 AsyncWebServerResponse *resp = request->beginResponse(200, __text_plain__F, ok ? F("Update OK - rebooting") : F("Update FAILED"));
                 resp->addHeader(F("Connection"), F("close"));
-                // send() лишь СТАВИТ ответ в очередь async-стека: ребут через delay()
-                // обрывал соединение до отправки — curl ждал ответа до своего таймаута.
-                // Ребутимся по onDisconnect: Connection:close закрывает соединение
-                // сервером сразу после доставки ответа клиенту.
+                // send() only QUEUES the response on the async stack: rebooting after a
+                // delay() tore the connection down before it was written, and curl then
+                // waited for an answer until its own timeout. Reboot from onDisconnect
+                // instead — Connection:close makes the server hang up as soon as the
+                // client has the response.
                 if (ok)
                 {
                     request->onDisconnect([]() { ESP.restart(); });
-                    // ...и не ждать закрытия вечно: клиент, держащий соединение, иначе
-                    // оставил бы устройство работать на СТАРОЙ прошивке неограниченно.
+                    // ...and do not wait for that close forever: a client holding the
+                    // connection open would otherwise leave the device running the OLD
+                    // firmware indefinitely.
                     scheduleReboot(PSTR("HTTP OTA"));
                 }
                 request->send(resp);
@@ -902,8 +1245,9 @@ public:
                 if (!_httpOtaAuthOk) return;
                 if (Update.write(data, len) != len)
                     Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
-                // total = длина POST-запроса: чуть больше бинарника (multipart-обвязка,
-                // <1%), но даёт честные проценты — Update.begin() шёл с SIZE_UNKNOWN.
+                // total = the length of the POST, which is slightly more than the binary
+                // (multipart wrapping, under 1%) but gives an honest percentage —
+                // Update.begin() was called with SIZE_UNKNOWN and knows nothing.
                 if (_otaProgressEvent) _otaProgressEvent((unsigned int)(index + len), (unsigned int)request->contentLength());
                 if (final)
                 {
@@ -966,10 +1310,10 @@ public:
                     if (Update.write(up.buf, up.currentSize) != up.currentSize)
                         Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
 #ifdef ESP32
-                    // total = длина POST (multipart-обвязка даёт погрешность <1%).
+                    // total = the length of the POST (multipart wrapping skews it by <1%).
                     if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, (unsigned int)server.clientContentLength());
 #else
-                    // ESP8266WebServer не отдаёт Content-Length наружу — total неизвестен.
+                    // ESP8266WebServer does not expose Content-Length, so total is unknown.
                     if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, 0);
 #endif
                 }
@@ -1093,6 +1437,54 @@ public:
             request->onDisconnect([]() { ESP.restart(); });
             scheduleReboot(PSTR("/restart"));
             request->send(resp); });
+
+        // Access points in the air + which one to prefer. Nothing links here (this
+        // library renders no navigation); the endpoints are listed in the banner above
+        // so a consumer can drive them from its own UI.
+        //
+        // ORDER MATTERS, and not by style. A plain string handed to server.on() becomes a
+        // BACKWARD-COMPATIBLE matcher on this server — "^{uri}(/.*)?$" — so "/aps" also
+        // matches "/aps/set" and "/aps/clear"; handlers are then tried in registration
+        // order and the first match wins. Registered the other way round, /aps swallowed
+        // both endpoints: fetch("/aps/set?...") came back with the whole scan page, which
+        // the page dutifully printed into its status line, and nothing was ever set.
+        // The specific routes therefore go FIRST. (The sync server matches exactly and
+        // does not care, but the two branches are kept in the same order so this cannot
+        // be "tidied" back.)
+#ifndef LIONWIFI_NO_PREFERRED_AP
+        server.on("/aps/set", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            String err;
+            char mac[18] = {0};
+            if (!ApplyApsSet(request->hasParam("bssid") ? request->getParam("bssid")->value().c_str() : nullptr,
+                             request->hasParam("n") ? request->getParam("n")->value().c_str() : nullptr,
+                             request->hasParam("ssid") ? request->getParam("ssid")->value().c_str() : nullptr,
+                             err, mac))
+            {
+                request->send(400, __text_plain__F, err);
+                return;
+            }
+            // Plain text on purpose: the page calls this with fetch() and never leaves
+            // /aps, and a caller of its own gets something trivial to check.
+            request->send(200, __text_plain__F, String(F("switching to ")) + mac); });
+        server.on("/aps/clear", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            ClearPreferredAp();
+            request->redirect("/aps"); });
+#endif
+#ifndef LIONWIFI_NO_AP_PAGE
+        server.on("/aps", HTTP_GET, [this](AsyncWebServerRequest *request)
+                  {
+            if (!_fsBrowser->DoAuth(request)) return;
+            // The page is bounded (a handful of rows), and this branch only ever runs on
+            // ESP32 where the heap is measured in hundreds of KB — so a response stream
+            // is fine here, unlike the unbounded file listing next door.
+            AsyncResponseStream *resp = request->beginResponseStream(__text_html__F);
+            renderAps(*resp);
+            request->send(resp); });
+#endif
 #else
 #if !defined(ESP32)
             server.on(F("/lion-tasks"), [this]()
@@ -1124,7 +1516,50 @@ public:
             server.send(200, __text_plain__F, F("Restarting..."));
             delay(100);
             ESP.restart(); });
+
+            // See the async twins above for what these are, why nothing links to them and
+            // why the specific routes are registered before /aps.
+#ifndef LIONWIFI_NO_PREFERRED_AP
+            server.on(F("/aps/set"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            String err;
+            char mac[18] = {0};
+            if (!ApplyApsSet(server.hasArg("bssid") ? server.arg("bssid").c_str() : nullptr,
+                             server.hasArg("n") ? server.arg("n").c_str() : nullptr,
+                             server.hasArg("ssid") ? server.arg("ssid").c_str() : nullptr, err, mac))
+            {
+                server.send(400, __text_plain__F, err);
+                return;
+            }
+            // See the async twin: plain text, the page stays on /aps.
+            server.send(200, __text_plain__F, String(F("switching to ")) + mac); });
+            server.on(F("/aps/clear"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            ClearPreferredAp();
+            server.sendHeader(F("Location"), F("/aps"), true);
+            server.send(302, __text_plain__F, ""); });
+#endif // LIONWIFI_NO_PREFERRED_AP
+#ifndef LIONWIFI_NO_AP_PAGE
+            server.on(F("/aps"), [this]()
+                      {
+            if (!_fsBrowser->DoAuth()) return;
+            // Streamed, not buffered: this branch is the one that runs on the ESP8266,
+            // where a page-sized contiguous String is exactly what fails first.
+            server.setContentLength(CONTENT_LENGTH_UNKNOWN);
+            server.send(200, __text_html__F, "");
+            ServerStream out(server);
+            renderAps(out);
+            out.flush();
+#ifdef ESP32
+            server.sendContent(""); // ESP32 WebServer: terminate the chunked response
+#else
+            server.chunkedResponseFinalize();
 #endif
+            });
+#endif
+#endif // async vs sync server
 
         _fsBrowser = new FsBrowser(server, WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
         _fsBrowser->AddRoutes();
@@ -1209,17 +1644,53 @@ private:
         }
 #endif
 
+        // A freshly chosen access point: re-associate now, so the choice is checked while
+        // somebody is looking. Here and not in the request handler — see the comment at
+        // _reconnectAt. We flip _connected ourselves so the branch below does not
+        // read our own teardown as a fault and reconnect a second time; the consumer's
+        // disconnect callback still fires, because from its side the link really did go.
+#ifndef LIONWIFI_NO_PREFERRED_AP
+        if (_reconnectAt && (int32_t)(millis() - _reconnectAt) >= 0) // signed: survives the wrap
+        {
+            _reconnectAt = 0;
+            Logger.Log_P(ILogger::LvlInfo, PSTR("Re-associating to try the new preferred AP"));
+            if (_connected)
+            {
+                _connected = false;
+                _lastConnectedTime = millis();
+                if (_disconEvent)
+                    _disconEvent();
+            }
+            // Leave the current point explicitly, radio still up (false = do not power it
+            // down). Without this the SDK can keep reporting WL_CONNECTED for the old
+            // association for a moment, and the block below would read that as "connected
+            // already" — announcing the OLD access point as the result of the move.
+            // On ESP32 Reconnect() tears down again anyway; a second disconnect is free.
+            WiFi.disconnect(false);
+            Reconnect();
+        }
+#endif // LIONWIFI_NO_PREFERRED_AP
+
         if (WiFi.status() == WL_CONNECTED)
         {
             if (!_connected)
             {
                 _connected = true;
                 _lastConnectedTime = millis();
+                // Re-arm the preference for the NEXT association, whatever this one ended
+                // up joining. Deliberately does NOT overwrite the stored BSSID: we may be
+                // on a different point right now precisely because the preferred one was
+                // unreachable, and that does not make this one the operator's choice.
+                _prefArmed = true;
+                _prefPinned = false;
                 // RSSI right at association: the single number that separates "weak link"
                 // from every other explanation. Above -65 dBm is comfortable, -75 marginal,
                 // below -80 is where handshakes start timing out.
-                Logger.Log_P(ILogger::LvlInfo, PSTR("Connected to %s; IP address: %s; RSSI %d"),
-                             _ssids[_curApIdx]->c_str(), WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+                char apName[26];
+                ApNameSuffix(WiFi.BSSID(), apName, sizeof(apName)); // "" unless labelled
+                Logger.Log_P(ILogger::LvlInfo, PSTR("Connected to %s%s; IP address: %s; RSSI %d"),
+                             _ssids[_curApIdx]->c_str(), apName,
+                             WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
                 configTime(NTP_TZ_OFFSET_SEC, 0, NTP_SERVER);
 #if defined(ESP32)
                 server.begin();
@@ -1337,6 +1808,16 @@ private:
 #endif
             else if (millis() - _lastConnectStartTime > WIFI_CONNECT_TIMEOUT)
             {
+                // An attempt aimed at the preferred point never finished. Stop aiming
+                // there for now: a point that has gone away would otherwise cost this
+                // timeout on every single retry. The choice itself is kept — any
+                // successful connect re-arms it, and by then the point may be back.
+                if (_prefPinned)
+                {
+                    _prefPinned = false;
+                    _prefArmed = false;
+                    Logger.Log_P(ILogger::LvlWarning, PSTR("Preferred AP did not answer, falling back to the usual rule"));
+                }
                 ChangeIdx();
 #ifndef QUIET_WIFI_LOGS
                 Logger.Log_P(ILogger::LvlInfo, PSTR("Changing AP to %s after %lus"), _ssids[_curApIdx]->c_str(), WIFI_CONNECT_TIMEOUT / 1000ul);
@@ -1385,6 +1866,37 @@ private:
             Logger.EnsureFreeSpace(FS_LOW_SPACE_THRESHOLD, FS_LOW_SPACE_TARGET);
         }
 #endif
+#if LIONWIFI_CLOCK_JUMP_SEC > 0
+        // Does the wall clock still agree with uptime? Only once time is set — before that
+        // the clock sits at the epoch and the first NTP answer is a jump BY DESIGN.
+        if (_timeSet)
+        {
+            const uint32_t nowMs = millis();
+            if (!_clockSampleMs || nowMs - _clockSampleMs >= 60000ul)
+            {
+                time_t nowT;
+                time(&nowT);
+                if (_clockSampleMs) // not the first sample — there is something to compare
+                {
+                    // Both deltas in seconds. Unsigned millis subtraction survives the wrap.
+                    const long upSec = (long)((nowMs - _clockSampleMs) / 1000ul);
+                    const long clockSec = (long)(nowT - _clockSampleTime);
+                    const long drift = clockSec - upSec;
+                    if (drift >= LIONWIFI_CLOCK_JUMP_SEC || drift <= -(long)LIONWIFI_CLOCK_JUMP_SEC)
+                    {
+                        struct tm *ti = localtime(&nowT);
+                        Logger.Log_P(ILogger::LvlWarning,
+                                     PSTR("CLOCK JUMPED %+ld s (uptime +%lds, clock +%lds) now %02d:%02d:%02d"),
+                                     drift, upSec, clockSec,
+                                     ti ? ti->tm_hour : 0, ti ? ti->tm_min : 0, ti ? ti->tm_sec : 0);
+                    }
+                }
+                _clockSampleMs = nowMs ? nowMs : 1; // 0 means "no sample yet"
+                _clockSampleTime = nowT;
+            }
+        }
+#endif
+
         // Periodic log maintenance. The dateless-log size cap runs in ALL modes
         // (those logs accumulate even without NTP time, e.g. offline/guest); the
         // date-based clearing needs a valid date, so it only runs once time is set.
@@ -1533,6 +2045,283 @@ protected:
 #endif
     }
 
+#ifndef LIONWIFI_NO_PREFERRED_AP
+    // ---- preferred access point: persistence ----------------------------------------
+    // Two lines of text, SSID then MAC. Text rather than a packed struct so the file can
+    // be read (and fixed) straight from the file browser.
+    bool SavePreferredAp()
+    {
+        auto f = LIONWIFI_FS.open(F(LIONWIFI_PREFERRED_AP_FILE), "w");
+        if (!f)
+        {
+            Logger.Log_P(ILogger::LvlError, PSTR("Preferred AP: cannot write %s"),
+                         LIONWIFI_PREFERRED_AP_FILE);
+            return false;
+        }
+        char mac[18];
+        FormatBssid(_prefBssid, mac);
+        f.println(_prefSsid);
+        f.println(mac);
+        f.close();
+        Logger.Log_P(ILogger::LvlInfo, PSTR("Preferred AP set: %s on %s"), mac, _prefSsid.c_str());
+        return true;
+    }
+
+    // Absent file is the normal case (nothing preferred), so it is not an error and not
+    // logged: opening for read IS the existence check.
+    void LoadPreferredAp()
+    {
+        auto f = LIONWIFI_FS.open(F(LIONWIFI_PREFERRED_AP_FILE), "r");
+        if (!f)
+            return;
+        String ssid = f.readStringUntil('\n');
+        String mac = f.readStringUntil('\n');
+        f.close();
+        ssid.trim();
+        mac.trim();
+        if (!ssid.length() || !ParseBssid(mac.c_str(), _prefBssid))
+        {
+            Logger.Log_P(ILogger::LvlWarning, PSTR("Preferred AP: %s is unreadable, ignored"),
+                         LIONWIFI_PREFERRED_AP_FILE);
+            memset(_prefBssid, 0, 6);
+            return;
+        }
+        _prefSsid = ssid;
+        _prefStored = true;
+        Logger.Log_P(ILogger::LvlInfo, PSTR("Preferred AP: %s on %s"), mac.c_str(), ssid.c_str());
+    }
+
+    // Shared body of /aps/set, so the two server flavours differ only in how they read a
+    // query argument. Any of the three may be nullptr; see the endpoint docs in the
+    // banner at the top of this file. Returns false with a reason in `err`.
+    // macOut (18 bytes, optional) receives the normalised MAC for the answer page.
+    bool ApplyApsSet(const char *bssidArg, const char *nArg, const char *ssidArg, String &err,
+                     char *macOut = nullptr)
+    {
+        uint8_t bssid[6];
+        if (!bssidArg || !ParseBssid(bssidArg, bssid))
+        {
+            err = F("bssid=<aa:bb:cc:dd:ee:ff> required");
+            return false;
+        }
+        if (macOut)
+            FormatBssid(bssid, macOut);
+
+        // Which of OUR networks this point belongs to. Index (n=) is what the page sends
+        // — no escaping, and it cannot name a network we do not have. A caller of its own
+        // may pass ssid= instead; with neither, the network currently in use is meant.
+        const char *ssid = nullptr;
+        if (nArg && *nArg)
+        {
+            int n = atoi(nArg);
+            if (n < 0 || n >= _ssids.Length())
+            {
+                err = F("n= out of range");
+                return false;
+            }
+            ssid = _ssids[n]->c_str();
+        }
+        else if (ssidArg && *ssidArg)
+            ssid = ssidArg;
+        else if (_ssids.Length())
+            ssid = _ssids[_curApIdx]->c_str();
+
+        if (!ssid || !*ssid)
+        {
+            err = F("no SSID to attach this BSSID to");
+            return false;
+        }
+        if (!SetPreferredAp(ssid, bssid))
+        {
+            err = F("could not store the choice");
+            return false;
+        }
+        // Re-associate right away so the choice is VERIFIED instead of taken on faith: a
+        // BSSID typed or clicked by mistake would otherwise sit in the file until the next
+        // reconnect — possibly days — and then fail where nobody is watching. Deferred to
+        // Loop() after a grace period, see _reconnectAt.
+        _reconnectAt = millis() + LIONWIFI_AP_SWITCH_DELAY_MS;
+        if (!_reconnectAt)
+            _reconnectAt = 1; // millis() wrapped exactly onto 0 — keep "pending" truthy
+        return true;
+    }
+#endif // LIONWIFI_NO_PREFERRED_AP
+
+#ifndef LIONWIFI_NO_AP_PAGE
+    // Row printf, same reason as FsBrowser's LS_ROW_PRINTF: the format string stays in
+    // flash on the ESP8266 (printf_P), while on ESP32 PROGMEM is flat and Print has no
+    // printf_P at all.
+#ifdef ESP32
+#define LIONWIFI_AP_PRINTF(o, fmt, ...) (o).printf(fmt, ##__VA_ARGS__)
+#else
+#define LIONWIFI_AP_PRINTF(o, fmt, ...) (o).printf_P(PSTR(fmt), ##__VA_ARGS__)
+#endif
+
+    // ---- /aps rendering ---------------------------------------------------------------
+    // Into any Print, so the sync path streams it through ServerStream and the async one
+    // through a response stream — the same split FsBrowser uses for its listing.
+    //
+    // The scan is BLOCKING (~2 s, every channel) and the station is off-channel for it:
+    // traffic stalls, and a request being served elsewhere at that moment will surface in
+    // the stall log. That is the price of seeing the neighbourhood, and it is why nothing
+    // links here and nothing calls this on a timer — it is a page opened by hand.
+    void renderAps(Print &out)
+    {
+        out.print(F("<!doctype html><html><head><meta charset=\"utf-8\">"
+                    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+                    "<title>Access points</title><style>"
+                    "body{font-family:sans-serif;margin:12px;font-size:14px}"
+                    "table{border-collapse:collapse;width:100%;max-width:760px}"
+                    "th,td{padding:5px 8px;border-bottom:1px solid #ccc;text-align:left}"
+                    "th{background:#eee;font-size:12px}"
+                    "tr.ours td{font-weight:600}"
+                    "tr.pref td{background:#e8f5e9}"
+                    ".dot{color:#1976d2;font-weight:700}"
+                    ".act{margin-right:8px}"
+                    ".legend{color:#666;font-size:12px}"
+                    "</style></head><body>"
+                    // Nothing links TO this page, so it needs a way back out — landing
+                    // here from a bookmark and having to edit the address bar is silly.
+                    "<h3>Access points <a class=\"legend\" href=\"/\">&larr; home</a></h3>"));
+
+        // Where we are RIGHT NOW, which is a different question from what is preferred:
+        // the preference applies to associations, and an association can have landed
+        // elsewhere. Both have to be visible, or the page cannot be read.
+        const uint8_t *curBssid = _connected ? WiFi.BSSID() : nullptr;
+        if (curBssid)
+        {
+            char mac[18], nm[26];
+            FormatBssid(curBssid, mac);
+            ApNameSuffix(curBssid, nm, sizeof(nm));
+            LIONWIFI_AP_PRINTF(out, "<p>Connected: <b class=\"dot\">&#9679;</b> <b>%s</b>%s on <b>%s</b>, RSSI %d, ch %d</p>",
+                               mac, nm, WiFi.SSID().c_str(), (int)WiFi.RSSI(), (int)WiFi.channel());
+        }
+        else
+            out.print(F("<p>Connected: <i>not associated</i></p>"));
+
+        String prefSsid;
+        uint8_t prefBssid[6];
+        bool havePref = GetPreferredAp(prefSsid, prefBssid);
+        if (havePref)
+        {
+            char mac[18];
+            FormatBssid(prefBssid, mac);
+            LIONWIFI_AP_PRINTF(out, "<p>Preferred: <b>%s</b> on <b>%s</b> &nbsp;<a class=\"act\" href=\"/aps/clear\">clear</a></p>",
+                               mac, prefSsid.c_str());
+        }
+        else
+            out.print(F("<p>Preferred: <i>none</i> — associations pick by the built-in rule.</p>"));
+        out.print(F("<p id=\"s\" class=\"legend\"></p>"));
+
+        // The scan is ASYNCHRONOUS, and that is not a refinement — it is the difference
+        // between working and rebooting the node. A blocking scan stands for ~2 s, and on
+        // the async server this function runs in the AsyncTCP task: block there and the
+        // connection times out underneath us, the request object is freed, and the send()
+        // that follows writes into dead memory. (Seen: opening /aps reset an ESP32,
+        // SW_CPU_RESET.) scanNetworks(true) only asks the driver to start and returns at
+        // once, so nothing is held up anywhere.
+        //
+        // The price is that results are not ready within the request that started them, so
+        // a visit takes two loads: the first kicks the scan and the page reloads itself,
+        // the second renders and frees the list. Freeing right after rendering is
+        // deliberate — the SDK holds those entries until told otherwise, and on a node with
+        // ~15 KB of heap a stale list of every access point in the neighbourhood is not
+        // something to keep around between visits.
+        int found = WiFi.scanComplete();
+        if (found < 0)
+        {
+            if (found == WIFI_SCAN_RUNNING)
+                out.print(F("<p>Scanning&hellip;</p>"));
+            else
+            {
+                WiFi.scanNetworks(true); // async: returns immediately, results come later
+                out.print(F("<p>Scan started&hellip;</p>"));
+            }
+            // Come back for the results on our own. The station is off-channel for the
+            // sweep, so asking sooner would only pile requests onto a node that cannot
+            // answer them yet.
+            out.print(F("<script>setTimeout(function(){location='/aps'},4000);</script>"
+                        "</body></html>"));
+            return;
+        }
+        if (found == 0)
+        {
+            out.print(F("<p>Nothing in the air.</p></body></html>"));
+            WiFi.scanDelete();
+            return;
+        }
+
+        out.print(F("<table><thead><tr><th>SSID</th><th>BSSID</th><th>ch</th><th>RSSI</th><th></th></tr></thead><tbody>"));
+        for (int i = 0; i < found; i++)
+        {
+            String ssid;
+            uint8_t enc; // taken by reference, not shown: the page is about WHERE, not how
+            int32_t rssi, ch;
+            uint8_t *bssid = nullptr;
+            (void)enc;
+#ifdef ESP32
+            if (!WiFi.getNetworkInfo(i, ssid, enc, rssi, bssid, ch))
+                continue;
+#else
+            // The ESP8266 form carries a 'hidden' flag; the scan-index accessors
+            // (WiFi.channel(i)) are not even visible there — see FindBestAp.
+            bool hidden;
+            (void)hidden;
+            if (!WiFi.getNetworkInfo(i, ssid, enc, rssi, bssid, ch, hidden))
+                continue;
+#endif
+            // Only points on a network WE are configured for can be preferred: a BSSID
+            // means nothing on a network this node never joins (see _prefSsid).
+            int ours = -1;
+            for (int n = 0; n < _ssids.Length(); n++)
+                if (ssid == *_ssids[n])
+                {
+                    ours = n;
+                    break;
+                }
+            bool isPref = havePref && bssid && memcmp(bssid, prefBssid, 6) == 0;
+            bool isCur = curBssid && bssid && memcmp(bssid, curBssid, 6) == 0;
+
+            char mac[18], nm[26];
+            if (bssid)
+                FormatBssid(bssid, mac);
+            else
+                strcpy(mac, "?");
+            ApNameSuffix(bssid, nm, sizeof(nm));
+
+            LIONWIFI_AP_PRINTF(out, "<tr class=\"%s\"><td>%s%s</td><td>%s%s</td><td>%d</td><td>%d</td><td>",
+                               isPref ? "ours pref" : (ours >= 0 ? "ours" : ""),
+                               isCur ? "<span class=\"dot\">&#9679;</span> " : "",
+                               ssid.length() ? ssid.c_str() : "&lt;hidden&gt;", mac, nm, (int)ch, (int)rssi);
+            // Calls the endpoint from here instead of navigating to it: picking a point
+            // drops the link, and a normal link would leave the browser on a dead
+            // /aps/set?... address. This way the address never leaves /aps.
+            if (ours >= 0 && !isPref)
+                LIONWIFI_AP_PRINTF(out, "<a class=\"act\" href=\"#\" onclick=\"u('%s',%d);return false\">use</a>", mac, ours);
+            out.print(F("</td></tr>"));
+        }
+        out.print(F("</tbody></table>"));
+        // Rendered, so drop it: the SDK keeps those entries until told otherwise. This is
+        // also what makes the next visit scan afresh instead of showing a list from an
+        // hour ago — the state machine above finds nothing and kicks a new scan.
+        WiFi.scanDelete();
+
+        out.print(F("<p class=\"legend\"><span class=\"dot\">&#9679;</span> connected now &middot; "
+                    "green row = preferred &middot; bold = a network this node is configured for</p>"
+                    "<p class=\"legend\">Choosing a point RE-ASSOCIATES at once, so the choice is verified "
+                    "rather than taken on faith: the link drops for a few seconds. If the point does not "
+                    "answer, the node falls back to the normal rule and tries the preferred one again "
+                    "after the next successful connect.</p>"
+                    "<script>function u(b,n){var s=document.getElementById('s');"
+                    "s.textContent='switching to '+b+'...';"
+                    "fetch('/aps/set?bssid='+b+'&n='+n,{cache:'no-store'})"
+                    ".then(function(r){return r.text()}).then(function(t){"
+                    "s.textContent=t+' - reloading in 5 s';setTimeout(function(){location='/aps'},5000)})"
+                    ".catch(function(e){s.textContent='request failed: '+e})}</script>"
+                    "</body></html>"));
+    }
+#endif // LIONWIFI_NO_AP_PAGE
+
 #if defined(WIFI_BEST_AP) && !defined(ESP32)
     // The ESP8266 core has no setScanMethod/setSortMethod — WiFi.begin() there always
     // takes the first matching point the SDK stumbles over. So the choice has to be made
@@ -1600,6 +2389,34 @@ protected:
     {
         const char *ssid = _ssids[_curApIdx]->c_str();
         const char *pwd = _passwords[_curApIdx]->c_str();
+
+#ifndef LIONWIFI_NO_PREFERRED_AP
+        // Loaded here and not in Setup(): the filesystem is mounted by the consumer, and
+        // nothing guarantees that happens before Setup() runs.
+        if (!_prefLoaded)
+        {
+            _prefLoaded = true;
+            LoadPreferredAp();
+        }
+#endif
+
+        // The operator's choice outranks any automatic rule — that is what it is for.
+        // Only for the network it was stored on: this class rotates through several, and
+        // a BSSID from one of them is meaningless on another.
+        //
+        // Channel 0 rather than a stored one: the SDK then finds the point by BSSID, and
+        // a router that moved channel on its own does not turn the choice into a dud.
+        _prefPinned = false;
+        if (_prefStored && _prefArmed && _prefSsid == ssid)
+        {
+            char mac[18];
+            FormatBssid(_prefBssid, mac);
+            Logger.Log_P(ILogger::LvlInfo, PSTR("Aiming at preferred AP %s"), mac);
+            _prefPinned = true;
+            WiFi.begin(ssid, pwd, 0, _prefBssid, true);
+            return;
+        }
+
 #if defined(WIFI_BEST_AP) && !defined(ESP32)
         int32_t channel = 0;
         uint8_t bssid[6];

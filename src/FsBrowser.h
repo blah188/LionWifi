@@ -554,11 +554,13 @@ public:
             uint32_t pos = fsize > TailSize ? fsize - TailSize : 0;
             if (pos)
                 dataFile.seek(pos);
-            // Стримим хвост маленькими чанками с ПРАВИЛЬНЫМ Content-Length — без
-            // большого буфера. Раньше читали весь хвост (до 8 КБ) в char[] и отдавали
-            // send(200,type,buf), где buf копировался ещё и в String: на фрагментированной
-            // куче ESP8266 аллокация падала → тело пустое (Content-Length 0), хотя лог
-            // печатал read=TailSize. (streamFile() тоже нельзя — он ставит полный размер файла.)
+            // Stream the tail in small chunks under a CORRECT Content-Length, with no big
+            // buffer anywhere. It used to read the whole tail (up to 8 KB) into a char[]
+            // and hand it to send(200, type, buf), which copied it into a String on top of
+            // that: on a fragmented ESP8266 heap the allocation failed and the body came
+            // out EMPTY (Content-Length 0) while the log cheerfully reported
+            // read=TailSize. (streamFile() is no use either — it declares the whole file
+            // length, and we are sending only the end of it.)
             size_t tailLen = fsize - pos;
             _server.setContentLength(tailLen);
             _server.send(200, GetContentType(name), emptyString);
@@ -719,7 +721,7 @@ public:
                         if (dst.write(buf, got) != got)
                             err = F("write failed (FS full?)");
                         else if ((++chunks & 0x0F) == 0)
-                            delay(1); // покормить вотчдог / уступить задачам
+                            delay(1); // feed the watchdog / let other tasks in
                     }
                 }
                 if (src)
@@ -727,7 +729,7 @@ public:
                 if (dst)
                     dst.close();
                 if (err)
-                    LIONWIFI_FS.remove(to); // не оставлять огрызок
+                    LIONWIFI_FS.remove(to); // do not leave a half-written stub behind
             }
             Logger.UnlockFsSemaphore();
         }
@@ -759,7 +761,7 @@ public:
                         if (dst.write(buf, got) != got)
                             err = F("write failed (card full?)");
                         else if ((++chunks & 0x0F) == 0)
-                            delay(1); // покормить вотчдог / уступить задачам
+                            delay(1); // feed the watchdog / let other tasks in
                     }
                 }
                 if (src)
@@ -984,6 +986,39 @@ public:
     {
         if (!Logger.TryLockFsSemaphore())
             return;
+
+#ifdef LIONWIFI_LS_EXACT_ALLOC
+        // Count first, then allocate exactly once. Array grows by DOUBLING, and during a
+        // growth both buffers are alive (new[] → memcpy → delete[]) — so the last step
+        // from 32 to 64 entries peaks at 96 entries' worth, not 64. On an ESP8266 with
+        // ~10 KB free that peak is what makes a listing flaky, not the final array.
+        //
+        // Clear(n) on an empty array allocates exactly n and leaves the length at 0, which
+        // is precisely a capacity reservation (Reserve() would also set the LENGTH to n,
+        // and the append below would then start after the reserved slots).
+        //
+        // Opt-in because it walks the directory twice: cheap, but not free, and only worth
+        // it where heap is tight. A page opened by hand can afford the second pass.
+        {
+            int count = 0;
+#ifdef ESP32
+            File cdir = LIONWIFI_FS.open("/");
+            File cf;
+            while (cf = cdir.openNextFile())
+            {
+                LIONWIFI_WDT_FEED();
+                count++;
+            }
+#else
+            Dir cdir = LIONWIFI_FS.openDir("/");
+            while (cdir.next())
+                count++;
+#endif
+            if (count > 0)
+                files.Clear(count);
+        }
+#endif
+
 #ifdef ESP32
         File dir = LIONWIFI_FS.open("/");
         File file;
