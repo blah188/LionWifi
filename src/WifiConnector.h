@@ -113,6 +113,10 @@
 //   PING_ROUTER              Router IP/host string — enables periodic TCP ping;
 //                            reboots after PING_ROUTER_MAX_FAILURES (default 4)
 //                            misses, every PING_ROUTER_INTERVAL ms (default 30000).
+//   PING_ROUTER_RECONNECT_AFTER  Re-associate after this many misses, before the reboot.
+//                            0 = off (default). Set below MAX_FAILURES. The point is the
+//                            state a reboot cannot fix — a stale client record on the AP;
+//                            see the option's own comment further down.
 //
 //   Gratuitous ARP (opt-in, default OFF):
 //   LIONWIFI_GARP_INTERVAL_MS  Broadcast an unsolicited "this IP is at this MAC"
@@ -337,6 +341,27 @@ extern "C"
 
 #ifndef PING_ROUTER_MAX_FAILURES
 #define PING_ROUTER_MAX_FAILURES 4
+#endif
+
+// Re-associate after this many consecutive missed router pings, BEFORE giving up and
+// rebooting. 0 = off, which is the default on purpose: on a link that is simply dead the
+// re-association cannot help, and it costs a few seconds of downtime on every node that
+// would have recovered on its own.
+//
+// Where it does help is the state a reboot cannot fix: the access point still holds a
+// record of the client while the node no longer has a usable link. A reboot does NOT send
+// a deauth — the node just vanishes with its power and comes back — so the stale record
+// survives it. Reconnect() on ESP32 does WiFi.disconnect(true) first, which is exactly the
+// deauth that clears it. Seen on the villa master 20.09.2026: manual reboots did nothing,
+// kicking the client from the access point's own client list brought the node straight
+// back after two hours of silence.
+//
+// Set it BELOW PING_ROUTER_MAX_FAILURES so the softer step comes first, e.g. 3 and 3:
+// the third miss re-associates, a fourth (> MAX) reboots. The counter is not reset by the
+// re-association — that is deliberate, a node that cannot reach the router even after
+// re-associating has earned its reboot.
+#ifndef PING_ROUTER_RECONNECT_AFTER
+#define PING_ROUTER_RECONNECT_AFTER 0
 #endif
 
 // Gratuitous ARP. OFF by default: it costs airtime on every node that enables it,
@@ -1635,12 +1660,37 @@ private:
         }
 
 #ifdef ESP32
-        // Print what the event callback recorded — see the WiFi.onEvent() comment in
+        // The event callback recorded a disconnect — see the WiFi.onEvent() comment in
         // Setup() for the reason codes worth knowing.
+        //
+        // ACTING on it, rather than only printing it, is the point. Once the access point
+        // drops us, WiFi.status() keeps answering WL_CONNECTED for about two minutes, so
+        // the status-driven branch further down stays blind for exactly that long. Measured
+        // on a C3 hub 19.09.2026: two drops, 2 min 4 s to notice each of them, while the
+        // ESP8266 nodes that lost the same access point in the same second were back after
+        // 19 s. None of that delay is reconnecting — that took 4 s; all of it is the SDK
+        // still claiming a dead association. Everything that touches the network in the
+        // meantime fails instantly and pointlessly: the hub filled its log with refused
+        // polls to every device it knows, twice a day.
+        //
+        // A disconnect we caused ourselves does not come back here: the _reconnectAt path
+        // below clears _connected before calling WiFi.disconnect(), so its event arrives
+        // with _connected already false and falls through. No self-inflicted reconnect.
         if (_discReasonPending)
         {
             _discReasonPending = false;
             Logger.Log_P(ILogger::LvlWarning, PSTR("WiFi disconnect reason %u"), (unsigned)_discReason);
+            if (_connected)
+            {
+                // Same three steps as the status-driven branch below; that one will now
+                // find _connected already false and stay quiet, so the reason line above
+                // is what marks the moment of detection in the log.
+                _connected = false;
+                _lastConnectedTime = millis();
+                if (_disconEvent)
+                    _disconEvent();
+                Reconnect();
+            }
         }
 #endif
 
@@ -1761,6 +1811,9 @@ private:
                 // this runs in the WiFi task while handlers run elsewhere).
                 WiFiClient pingClient;
                 pingClient.setTimeout(WIFI_CLIENT_TIMEOUT);
+#if PING_ROUTER_RECONNECT_AFTER > 0
+                bool reassociate = false; // decided below, acted on once pingClient is closed
+#endif
                 if (pingClient.connect(PING_ROUTER, 80))
                 {
                     _routerPingErrorsInRow = 0;
@@ -1770,7 +1823,17 @@ private:
                 {
                     _routerPingSuccessesInRow = 0;
                     Logger.Log_P(ILogger::LvlWarning, PSTR("Router ping failed in %lums"), millis() - _lastRouterPingTime);
-                    if (++_routerPingErrorsInRow > PING_ROUTER_MAX_FAILURES)
+                    ++_routerPingErrorsInRow;
+#if PING_ROUTER_RECONNECT_AFTER > 0
+                    // Softer step before the reboot — see the option's comment above for
+                    // what it is actually for. Exactly `==`, so it fires once and the
+                    // reboot below still gets its turn on the next miss. Not done here
+                    // though: Reconnect() powers the radio down, and the ping client is
+                    // still open until a few lines below. Remembered, acted on after it
+                    // is closed. The reboot has no such problem — nothing survives it.
+                    reassociate = (_routerPingErrorsInRow == PING_ROUTER_RECONNECT_AFTER);
+#endif
+                    if (_routerPingErrorsInRow > PING_ROUTER_MAX_FAILURES)
                     {
                         Logger.Log_P(ILogger::LvlInfo, PSTR("!!! Rebooting device as router ping failed %d times"), _routerPingErrorsInRow);
                         delay(300);
@@ -1781,6 +1844,14 @@ private:
                 pingClient.stop();
 #else
                 pingClient.abort();
+#endif
+#if PING_ROUTER_RECONNECT_AFTER > 0
+                if (reassociate)
+                {
+                    Logger.Log_P(ILogger::LvlInfo, PSTR("Router unreachable %d times, re-associating"),
+                                 _routerPingErrorsInRow);
+                    Reconnect();
+                }
 #endif
             }
 #endif
@@ -2296,8 +2367,17 @@ protected:
             // Calls the endpoint from here instead of navigating to it: picking a point
             // drops the link, and a normal link would leave the browser on a dead
             // /aps/set?... address. This way the address never leaves /aps.
-            if (ours >= 0 && !isPref)
-                LIONWIFI_AP_PRINTF(out, "<a class=\"act\" href=\"#\" onclick=\"u('%s',%d);return false\">use</a>", mac, ours);
+            // Hidden only where there is nothing left to do — the preferred point we are
+            // already sitting on. A preferred point we have DRIFTED OFF still gets a link,
+            // and that is the whole difference: without it the only way back was to prefer
+            // some other point and then prefer this one again, because the node had roamed
+            // away on its own and the row that could bring it back was the one row with no
+            // action on it. Re-sending the same BSSID is safe and does the right thing:
+            // ApplyApsSet arms the re-association unconditionally, it never compares with
+            // the stored choice.
+            if (ours >= 0 && !(isPref && isCur))
+                LIONWIFI_AP_PRINTF(out, "<a class=\"act\" href=\"#\" onclick=\"u('%s',%d);return false\">%s</a>",
+                                   mac, ours, isPref ? "return" : "use");
             out.print(F("</td></tr>"));
         }
         out.print(F("</tbody></table>"));
@@ -2307,7 +2387,8 @@ protected:
         WiFi.scanDelete();
 
         out.print(F("<p class=\"legend\"><span class=\"dot\">&#9679;</span> connected now &middot; "
-                    "green row = preferred &middot; bold = a network this node is configured for</p>"
+                    "green row = preferred &middot; bold = a network this node is configured for &middot; "
+                    "<i>return</i> = go back to the preferred point we have drifted off</p>"
                     "<p class=\"legend\">Choosing a point RE-ASSOCIATES at once, so the choice is verified "
                     "rather than taken on faith: the link drops for a few seconds. If the point does not "
                     "answer, the node falls back to the normal rule and tries the preferred one again "

@@ -3,6 +3,42 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.7.0 — 2026-09-21
+
+### Changed
+- **ESP32 now acts on the disconnect event instead of waiting for `WiFi.status()`.** The
+  event callback already recorded the reason; all it did with it was print a line. Meanwhile
+  `WiFi.status()` keeps answering `WL_CONNECTED` for about two minutes after the access
+  point drops the station, and every decision in `LoopBody()` is made from that answer — so
+  the node stayed blind for exactly that long. Measured on an ESP32-C3 hub: two drops in a
+  day, 2 min 4 s to notice each of them, while ESP8266 nodes that lost the same access point
+  in the same second were back after 19 s. None of the delay was reconnecting — that took
+  4 s; all of it was the SDK still claiming a dead association, while everything that
+  touched the network failed instantly and pointlessly.
+  The ESP8266 path is untouched: its status flips honestly, and this block was always
+  ESP32-only. A disconnect the library caused itself does not trigger the new path — the
+  preferred-AP code clears `_connected` before calling `WiFi.disconnect()`, so its event
+  arrives with the flag already down and falls through.
+
+### Added
+- **`PING_ROUTER_RECONNECT_AFTER`** — re-associate after this many missed router pings,
+  before the watchdog gives up and reboots. `0` (off) by default, and deliberately so: on a
+  link that is simply dead the re-association cannot help, and it costs a few seconds of
+  downtime on every node that would have recovered on its own. What it does fix is the state
+  a reboot cannot: the access point still holding a record of the client while the station no
+  longer has a usable link. **A reboot does not send a deauth** — the node vanishes with its
+  power and comes back — so the stale record survives it, whereas `Reconnect()` tears the
+  association down first. Seen in the field: manual reboots did nothing for a node in that
+  state, and kicking the client from the access point's own list brought it back at once.
+  Set it below `PING_ROUTER_MAX_FAILURES` so the softer step comes first.
+- **`/aps` offers the preferred point back once the node has drifted off it.** The action
+  link used to be hidden on the preferred row — right while sitting on it, wrong once the
+  SDK has roamed away: the one row that could bring the node back was the only row with
+  nothing to click, and the way back was to prefer some other point and then prefer this one
+  again. The link now appears whenever the row is not both preferred and current, labelled
+  `return` in that case. Re-sending the same BSSID is safe: the endpoint arms the
+  re-association unconditionally and never compares against the stored choice.
+
 ## 1.6.0 — 2026-09-11
 
 ### Added
