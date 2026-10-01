@@ -3,6 +3,25 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.7.1 — 2026-10-01
+
+### Fixed
+- **ESP32 router ping no longer stalls the WiFi task ~18 s per missed ping.** The watchdog's
+  TCP ping (`pingClient.connect(PING_ROUTER, 80)`) took its connect timeout from
+  `setTimeout(WIFI_CLIENT_TIMEOUT)`, but ESP32's `WiFiClient::setTimeout()` is in **seconds**
+  (it multiplies by 1000), so the intended 3 s became a 3000 s connect timeout — effectively
+  none. A silent router then held the connect until lwip's own SYN give-up (~18.5 s, six
+  retransmissions, `CONFIG_LWIP_TCP_SYNMAXRTX`), blocking the WiFi task for that whole time on
+  every miss and starving anything sharing the core (e.g. an MQTT client). ESP8266's
+  `setTimeout()` is in milliseconds, so it was correct there and is left unchanged. The connect
+  timeout is now passed as an explicit millisecond argument to `connect()` on ESP32; a dead
+  router costs one ~3 s miss instead of an 18 s stall. Measured on the villa master:
+  `Router ping failed in Nms` dropped from ~18000 to ~3005.
+
+### Added
+- **`PING_ROUTER_CONNECT_TIMEOUT_MS`** (default `3000`) — connect timeout for the router ping,
+  in milliseconds. Kept short so a silent router costs one quick miss, not a task stall.
+
 ## 1.7.0 — 2026-09-21
 
 ### Changed

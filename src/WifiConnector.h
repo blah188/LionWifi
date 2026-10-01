@@ -117,6 +117,9 @@
 //                            0 = off (default). Set below MAX_FAILURES. The point is the
 //                            state a reboot cannot fix — a stale client record on the AP;
 //                            see the option's own comment further down.
+//   PING_ROUTER_CONNECT_TIMEOUT_MS  Ping connect timeout, ms (default 3000). On ESP32 this is
+//                            the real cap: WiFiClient::setTimeout() there is in SECONDS, so the
+//                            value is passed straight to connect() instead.
 //
 //   Gratuitous ARP (opt-in, default OFF):
 //   LIONWIFI_GARP_INTERVAL_MS  Broadcast an unsolicited "this IP is at this MAC"
@@ -362,6 +365,15 @@ extern "C"
 // re-associating has earned its reboot.
 #ifndef PING_ROUTER_RECONNECT_AFTER
 #define PING_ROUTER_RECONNECT_AFTER 0
+#endif
+
+// Connect timeout for the router ping, in MILLISECONDS. Kept short so a silent router costs
+// one quick miss, not a stalled task. It is passed as connect()'s explicit timeout argument
+// on ESP32 because WiFiClient::setTimeout() there is in SECONDS (it multiplies by 1000), so
+// setTimeout(WIFI_CLIENT_TIMEOUT) used to mean a multi-thousand-second connect timeout and the
+// SYN hung until lwip's own ~18s give-up, blocking the WiFi task. See the ping code below.
+#ifndef PING_ROUTER_CONNECT_TIMEOUT_MS
+#define PING_ROUTER_CONNECT_TIMEOUT_MS 3000
 #endif
 
 // Gratuitous ARP. OFF by default: it costs airtime on every node that enables it,
@@ -1810,11 +1822,21 @@ private:
                 // which a consumer may be using concurrently (esp. on ESP32 where
                 // this runs in the WiFi task while handlers run elsewhere).
                 WiFiClient pingClient;
-                pingClient.setTimeout(WIFI_CLIENT_TIMEOUT);
 #if PING_ROUTER_RECONNECT_AFTER > 0
                 bool reassociate = false; // decided below, acted on once pingClient is closed
 #endif
-                if (pingClient.connect(PING_ROUTER, 80))
+                // Connect timeout must be an explicit millisecond argument here. On ESP32
+                // WiFiClient::setTimeout() takes SECONDS, so setTimeout(WIFI_CLIENT_TIMEOUT) gave a
+                // multi-thousand-second connect timeout and a silent router hung the WiFi task for
+                // lwip's own ~18s SYN give-up. The 3-arg connect() sets exactly this timeout.
+                // On ESP8266 setTimeout() is in ms, so the old path stays correct there.
+#ifdef ESP32
+                bool pinged = pingClient.connect(PING_ROUTER, 80, PING_ROUTER_CONNECT_TIMEOUT_MS);
+#else
+                pingClient.setTimeout(WIFI_CLIENT_TIMEOUT);
+                bool pinged = pingClient.connect(PING_ROUTER, 80);
+#endif
+                if (pinged)
                 {
                     _routerPingErrorsInRow = 0;
                     ++_routerPingSuccessesInRow;
