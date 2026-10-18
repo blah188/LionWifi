@@ -1346,12 +1346,13 @@ public:
                 {
                     if (Update.write(up.buf, up.currentSize) != up.currentSize)
                         Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
-#ifdef ESP32
                     // total = the length of the POST (multipart wrapping skews it by <1%).
+#ifdef ESP32
                     if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, (unsigned int)server.clientContentLength());
 #else
-                    // ESP8266WebServer does not expose Content-Length, so total is unknown.
-                    if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, 0);
+                    // ESP8266WebServer has no clientContentLength(), but the core copies the
+                    // request's Content-Length into HTTPUpload before UPLOAD_FILE_START.
+                    if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, (unsigned int)up.contentLength);
 #endif
                 }
                 else if (up.status == UPLOAD_FILE_END && _httpOtaAuthOk)

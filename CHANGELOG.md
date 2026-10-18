@@ -3,6 +3,16 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.7.2 — 2026-10-18
+
+### Fixed
+- **ESP8266 HTTP OTA progress now reports `total`.** It was hard-wired to `0` on the
+  assumption that ESP8266WebServer exposes no Content-Length. It has no getter, but the core
+  copies the request's Content-Length into `HTTPUpload::contentLength` before
+  `UPLOAD_FILE_START` (core 3.1.2, `Parsing-impl.h`), so `total` is now the POST length — the
+  same meaning as on ESP32 (multipart wrapping skews it by <1%). Verified on hardware
+  (LogHolder, 8266): percentages and progress bar on the second HTTP upload.
+
 ## 1.7.1 — 2026-10-01
 
 ### Fixed
