@@ -171,6 +171,18 @@
 //   WIFI_TX_POWER            Set TX power explicitly, as a wifi_power_t enumerator. Meant
 //                            for LOWERING it: small boards with weak decoupling fail to
 //                            associate at full power (-D WIFI_TX_POWER=WIFI_POWER_8_5dBm).
+//   LIONWIFI_WIFI_MODEM_SLEEP  Keep WiFi modem sleep ON (WIFI_PS_MIN_MODEM) instead of the
+//                            default WIFI_PS_NONE. REQUIRED on ESP32 when the node also
+//                            uses Bluetooth: the BLE controller refuses to start without
+//                            it — esp_bt_controller_enable() -> coex_core_enable() ->
+//                            abort(), with "Should enable WiFi modem sleep when both WiFi
+//                            and Bluetooth are enabled" (the string lives in libcoexist.a,
+//                            not in any header). The crash points at NimBLEDevice::init,
+//                            which sends you looking at the BLE library instead of here.
+//                            Setting it once from the sketch is NOT enough: the no-sleep
+//                            mode is reasserted before every association attempt below.
+//                            Cost: station latency grows to about the DTIM interval, so
+//                            pages and OTA get a little lazier. ESP8266 ignores this.
 //
 //   FsBrowser extras:
 //   USE_SD_CARD [+ SDFAT]    Also browse an SD card (SdFat when SDFAT is set).
@@ -415,6 +427,18 @@ extern "C"
 #ifdef LIONWIFI_NO_PREFERRED_AP
 #ifndef LIONWIFI_NO_AP_PAGE
 #define LIONWIFI_NO_AP_PAGE // no storage means nothing for the page to show or set
+#endif
+#endif
+
+// Station power-save mode, applied on every association (see ApplyRadioSettings).
+// Default is none: the station stays awake, which keeps web pages and polling snappy.
+// -D LIONWIFI_WIFI_MODEM_SLEEP switches it to minimum modem sleep, which is MANDATORY
+// when Bluetooth shares the radio — see the flag's note at the top of this file.
+#ifdef ESP32
+#ifdef LIONWIFI_WIFI_MODEM_SLEEP
+#define LIONWIFI_PS_MODE WIFI_PS_MIN_MODEM
+#else
+#define LIONWIFI_PS_MODE WIFI_PS_NONE
 #endif
 #endif
 
@@ -2094,7 +2118,9 @@ protected:
     {
 #ifdef ESP32
         WiFi.mode(WIFI_STA);
-        WiFi.setSleep(WIFI_PS_NONE);
+        // Reasserted on every attempt, so a sketch cannot hold a different mode on its
+        // own — hence the compile-time choice (LIONWIFI_WIFI_MODEM_SLEEP).
+        WiFi.setSleep(LIONWIFI_PS_MODE);
         // Radio settings below must sit HERE: after WiFi.mode() (before it esp_wifi is not
         // initialised yet and the calls fail) and before WiFi.begin() (applied later, they
         // only take effect on the NEXT reconnect).
@@ -2584,7 +2610,7 @@ protected:
     {
         WiFi.mode(WIFI_STA);
 #ifdef ESP32
-        WiFi.setSleep(WIFI_PS_NONE);
+        WiFi.setSleep(LIONWIFI_PS_MODE);
 #else
             WiFi.setSleepMode(WIFI_NONE_SLEEP);
 #endif

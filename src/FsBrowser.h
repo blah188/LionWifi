@@ -99,8 +99,8 @@ extern SdFat SD;
 #if !defined(ESP32) || defined(NO_ASYNC_WEB_SERVER)
 #include <ServerStream.h> // sync-server chunked streaming (not available for async)
 #endif
-#if defined(USE_SD_CARD) && defined(SDFAT) && defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
-#include <memory> // shared_ptr keeps the SdFat file alive across async chunked sends
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+#include <memory> // shared_ptr keeps an open file alive across async sends (tail, SdFat)
 #endif
 
 #include "DirEntry.h"
@@ -123,6 +123,25 @@ extern const char __slash_favicon_ico__P[];
 #define LIONWIFI_FS_CHUNK 128
 #else
 #define LIONWIFI_FS_CHUNK 512
+#endif
+#endif
+
+// Tail window: /tail/<f> and /sd/tail/<f> take ?bytes=N (the last N bytes) and ?from=X
+// (from byte X to the end; with bytes= as well, N bytes from X). No parameters = the last
+// 8 KB, as before. The window is byte-exact, not line-aligned: the first line of a tail is
+// usually partial, a from= taken from the previous X-File-Size starts on a line. The answer
+// carries X-File-Size (the whole file) and X-Tail-From (where this body starts), so a client
+// polls for new data with ?from=<previous X-File-Size>; from past the end = 200, empty body.
+// LIONWIFI_TAIL_MAX caps one answer: a tail keeps its end (X-Tail-From moves up), a from=
+// keeps its start (ask again from X-Tail-From + Content-Length). Both servers stream the
+// window in chunks, so the cap is about how long one request may hold the server — the sync
+// one serves nobody else meanwhile — not about memory. Measured on an ESP8266 from SD:
+// ~134 KB/s, so 1 MB held the loop 7.5 s; 512 KB is ~4 s and still a month of a 5-minute log.
+#ifndef LIONWIFI_TAIL_MAX
+#if defined(ESP8266)
+#define LIONWIFI_TAIL_MAX (512UL * 1024UL)
+#else
+#define LIONWIFI_TAIL_MAX (1024UL * 1024UL)
 #endif
 #endif
 
@@ -218,7 +237,49 @@ int DirEntrySort(const void *cmp1, const void *cmp2);
 
 class FsBrowser
 {
-    const uint16_t TailSize = 8192;
+    const uint32_t TailSize = 8192; // default tail, without ?bytes=
+
+    // ?from= / ?bytes= of a tail request (see LIONWIFI_TAIL_MAX above)
+    struct TailArgs
+    {
+        bool hasFrom = false, hasBytes = false;
+        uint32_t from = 0, bytes = 0;
+    };
+
+    // Digits only: a typo must not silently become 0 (from=0 is the whole file)
+    static bool ParseTailNumber(const String &s, uint32_t &out)
+    {
+        const char *c = s.c_str();
+        if (*c < '0' || *c > '9')
+            return false;
+        char *end;
+        unsigned long v = strtoul(c, &end, 10);
+        if (*end)
+            return false;
+        out = (uint32_t)v;
+        return true;
+    }
+
+    void TailWindow(uint32_t fsize, const TailArgs &a, uint32_t &pos, uint32_t &len) const
+    {
+        if (a.hasFrom)
+        {
+            pos = a.from < fsize ? a.from : fsize;
+            len = fsize - pos;
+            if (a.hasBytes && a.bytes < len)
+                len = a.bytes;
+            if (len > LIONWIFI_TAIL_MAX) // keep the start: the client continues from pos + len
+                len = LIONWIFI_TAIL_MAX;
+        }
+        else
+        {
+            uint32_t want = a.hasBytes ? a.bytes : TailSize;
+            if (want > LIONWIFI_TAIL_MAX) // keep the end: X-Tail-From shows where it starts
+                want = LIONWIFI_TAIL_MAX;
+            pos = fsize > want ? fsize - want : 0;
+            len = fsize - pos;
+        }
+    }
 
 private:
 #ifdef ESP32
@@ -398,13 +459,59 @@ public:
 #endif
 
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+    static bool GetTailArgs(AsyncWebServerRequest *request, TailArgs &a)
+    {
+        auto p = request->getParam("from");
+        if (p && !(a.hasFrom = ParseTailNumber(p->value(), a.from)))
+            return false;
+        p = request->getParam("bytes");
+        if (p && !(a.hasBytes = ParseTailNumber(p->value(), a.bytes)))
+            return false;
+        return true;
+    }
+
+    // f is open; seeks it to the window and queues the response. Works for fs::File and
+    // SdFat's FsFile alike — they share size/seek/read.
+    template <typename F>
+    void SendTailAsync(AsyncWebServerRequest *request, std::shared_ptr<F> f, const char *name, bool sd, const TailArgs &a)
+    {
+        uint32_t fsize = f->size(), pos, len;
+        TailWindow(fsize, a, pos, len);
+        if (pos)
+            f->seek(pos);
+        AsyncWebServerResponse *response;
+        if (len)
+            response = request->beginResponse(String(GetContentType(name)), len,
+                [f, len](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
+                {
+                    // A from=&bytes= window ends mid-file: never read past it
+                    if (index >= len)
+                        return 0;
+                    if (maxLen > len - index)
+                        maxLen = len - index;
+                    int n = f->read(buffer, maxLen);
+                    return n > 0 ? (size_t)n : 0;
+                });
+        else // nothing new past from= — a callback response of length 0 is not worth the risk
+            response = request->beginResponse(200, String(GetContentType(name)), "");
+        response->addHeader(F("X-File-Size"), String(fsize));
+        response->addHeader(F("X-Tail-From"), String(pos));
+        request->send(response);
+        Logger.Log_P(ILogger::LvlDebug, PSTR("Sending tail %s(%s), %lu bytes from %lu of %lu"), name, sd ? "Sd" : "SP",
+                     (unsigned long)len, (unsigned long)pos, (unsigned long)fsize);
+    }
+
+    // Always true = "a response is queued", errors included. The result travels up through
+    // HandleFileRead() to onNotFound(), which answers false with its own 404 — on top of
+    // ours: a 429 "Server Busy" or a 400 on a bad tail window reached the client as a bare
+    // 404 (the same trap DoAuth fell into before 1.3.4).
     bool SendFileResponse(const char *name, AsyncWebServerRequest *request, bool sd, bool tail, bool forceDownload = false)
     {
         bool exists = false;
         if (!Logger.TryLockFsSemaphore())
         {
             request->send(429, __text_plain__F, F("Server Busy"));
-            return false;
+            return true;
         }
 #ifdef USE_SD_CARD
         if (sd) {
@@ -422,45 +529,47 @@ public:
             Logger.UnlockFsSemaphore();
             Logger.Log_P(ILogger::LvlWarning, PSTR("sendFileResponse: %s file %s not found"), (sd ? F("SD") : F("SP")), name);
             request->send(404, __text_plain__F, String(F("Can't find ")) + (sd ? F("SD") : F("SP")) + F(" file ") + name);
-            return false;
+            return true;
         }
-        if (tail) // Only tail — read the last TailSize bytes into buf
+        if (tail) // Stream the window under a correct Content-Length — no buffer of its size
         {
-            char *buf = new char[TailSize + 1];
-            if (!buf)
+            TailArgs a;
+            if (!GetTailArgs(request, a))
             {
                 Logger.UnlockFsSemaphore();
-                request->send(500, __text_plain__F, F("500: out of memory"));
-                return false;
+                request->send(400, __text_plain__F, F("400: from/bytes must be a number"));
+                return true;
             }
-            size_t read = 0;
+            // Like a full download below: the open file lives in the response (shared_ptr
+            // in the filler) and the FS semaphore is NOT held for the whole transfer.
 #ifdef USE_SD_CARD
             if (sd)
             {
                 String sdPath = name;
                 if (sdPath.length() > 0 && sdPath[0] != '/')
                     sdPath = "/" + sdPath;
-                MySdFile f = SD.open(sdPath.c_str(), SD_FILE_READ);
-                if (f.size() > TailSize)
-                    f.seek(f.size() - TailSize);
-                read = f.readBytes(buf, TailSize);
-                f.close();
-            }
-            else
+#ifdef SDFAT
+                auto f = std::make_shared<FsFile>();
+                bool opened = f->open(sdPath.c_str(), O_RDONLY);
+#else
+                auto f = std::make_shared<File>(SD.open(sdPath.c_str(), SD_FILE_READ));
+                bool opened = (bool)*f;
 #endif
-            {
-                File f = LIONWIFI_FS.open(name, "r");
-                uint32_t tailPos = f.size() > TailSize ? f.size() - TailSize : 0;
-                if (tailPos)
-                    f.seek(tailPos);
-                read = f.readBytes(buf, TailSize);
-                Logger.Log_P(ILogger::LvlDebug, PSTR("sendFileResponse: sending %u tail bytes (from pos %lu) of file %s"), (unsigned)read, (unsigned long)tailPos, name);
-                f.close();
+                if (opened)
+                    SendTailAsync(request, f, name, sd, a);
+                Logger.UnlockFsSemaphore();
+                if (!opened)
+                    request->send(500, __text_plain__F, F("500: SD open failed"));
+                return true;
             }
-            buf[read] = 0;
-            request->send(200, __text_plain__F, buf);
-            delete[] buf;
+#endif
+            auto f = std::make_shared<File>(LIONWIFI_FS.open(name, "r"));
+            bool opened = (bool)*f;
+            if (opened)
+                SendTailAsync(request, f, name, sd, a);
             Logger.UnlockFsSemaphore();
+            if (!opened)
+                request->send(500, __text_plain__F, F("500: open failed"));
             return true;
         }
 
@@ -480,7 +589,7 @@ public:
             {
                 Logger.UnlockFsSemaphore();
                 request->send(500, __text_plain__F, F("500: SD open failed"));
-                return false;
+                return true;
             }
             AsyncWebServerResponse *response = request->beginChunkedResponse(GetContentType(name),
                 [f](uint8_t *buffer, size_t maxLen, size_t index) -> size_t
@@ -547,13 +656,24 @@ public:
             _server.sendHeader(F("Cache-Control"), F("must-revalidate, post-check=0, pre-check=0"));
             _server.sendHeader(F("Pragma"), F("public"));
         }
-        if (tail) // Send only the last TailSize bytes with a CORRECT Content-Length.
+        if (tail) // Send only the window (see LIONWIFI_TAIL_MAX) with a CORRECT Content-Length.
         {         // streamFile() advertises the full file size while sending only
                   // the tail → body/length mismatch and a hung client on big logs.
-            uint32_t fsize = dataFile.size();
-            uint32_t pos = fsize > TailSize ? fsize - TailSize : 0;
+            TailArgs a;
+            if ((_server.hasArg(F("from")) && !(a.hasFrom = ParseTailNumber(_server.arg(F("from")), a.from)))
+                || (_server.hasArg(F("bytes")) && !(a.hasBytes = ParseTailNumber(_server.arg(F("bytes")), a.bytes))))
+            {
+                dataFile.close();
+                Logger.UnlockFsSemaphore();
+                _server.send(400, __text_plain__F, F("400: from/bytes must be a number"));
+                return false;
+            }
+            uint32_t fsize = dataFile.size(), pos, tailWindow;
+            TailWindow(fsize, a, pos, tailWindow);
             if (pos)
                 dataFile.seek(pos);
+            _server.sendHeader(F("X-File-Size"), String(fsize));
+            _server.sendHeader(F("X-Tail-From"), String(pos));
             // Stream the tail in small chunks under a CORRECT Content-Length, with no big
             // buffer anywhere. It used to read the whole tail (up to 8 KB) into a char[]
             // and hand it to send(200, type, buf), which copied it into a String on top of
@@ -561,7 +681,7 @@ public:
             // out EMPTY (Content-Length 0) while the log cheerfully reported
             // read=TailSize. (streamFile() is no use either — it declares the whole file
             // length, and we are sending only the end of it.)
-            size_t tailLen = fsize - pos;
+            size_t tailLen = tailWindow;
             _server.setContentLength(tailLen);
             _server.send(200, GetContentType(name), emptyString);
             uint8_t chunk[LIONWIFI_FS_CHUNK];
@@ -587,6 +707,9 @@ public:
 #endif
                 _server.sendContent((const char *)chunk, (size_t)n);
                 sent += n;
+                // A month of data is thousands of chunks; a write that fits the socket
+                // buffer does not yield, so give the system its turn here
+                yield();
 #ifdef LIONWIFI_WEB_TRACE
                 const uint32_t chunkMs = millis() - chunkStart;
                 tailChunks++;
@@ -598,11 +721,12 @@ public:
             dataFile.close();
             Logger.UnlockFsSemaphore();
 #ifdef LIONWIFI_WEB_TRACE
-            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes in %lu ms (%u chunks)"),
-                         name, sd ? "Sd" : "SP", (unsigned)sent,
+            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes from %lu in %lu ms (%u chunks)"),
+                         name, sd ? "Sd" : "SP", (unsigned)sent, (unsigned long)pos,
                          (unsigned long)(millis() - tailStart), tailChunks);
 #else
-            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes"), name, sd ? "Sd" : "SP", (unsigned)sent);
+            Logger.Log_P(ILogger::LvlDebug, PSTR("Sent tail %s(%s), %u bytes from %lu"), name, sd ? "Sd" : "SP",
+                         (unsigned)sent, (unsigned long)pos);
 #endif
             return true;
         }

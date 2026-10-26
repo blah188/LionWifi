@@ -3,6 +3,35 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.8.0 — 2026-10-26
+
+### Added
+- **Tail of any length, and from any byte.** `/tail/<f>` and `/sd/tail/<f>` take
+  `?bytes=N` (the last N bytes) and `?from=X` (from byte X; with `bytes=`, N bytes from
+  X). No parameters = the last 8 KB, as before. Answers carry `X-File-Size` and
+  `X-Tail-From`, so a client follows a growing file with `?from=<previous X-File-Size>`.
+  One answer is capped at **`LIONWIFI_TAIL_MAX`** (512 KB on ESP8266 — ~4 s of a blocked
+  loop at the measured 134 KB/s from SD; 1 MB on ESP32). A malformed number is
+  a `400`, not a silent `0`.
+- **`LIONWIFI_WIFI_MODEM_SLEEP`** (ESP32) — keep WiFi modem sleep on instead of
+  `WIFI_PS_NONE`. Required when the node also runs Bluetooth: the BLE controller aborts in
+  `coex_core_enable()` without it. Reasserted on every association, hence a build flag.
+
+### Changed
+- **ESP32 async tail streams instead of buffering.** It read the whole tail into
+  `new char[]` and sent it as a C string — fine for a fixed 8 KB, an arbitrary allocation
+  with arbitrary length. It now streams from the open file under an exact
+  `Content-Length`, like a full download, and no longer stops at the first NUL. Its
+  content type follows the file name, as on the sync server (was always `text/plain`).
+- Sync tail yields between chunks: a month of data is thousands of them.
+
+### Fixed
+- **ESP32 async: file-route errors reached the client as a bare `404`.** `onNotFound()`
+  answers its own 404 whenever `HandleFileRead()` returns false, and `SendFileResponse()`
+  returned false right after queuing its error — so a `429 Server Busy`, the detailed
+  "Can't find" 404, a `500` and the new `400` were all overwritten. It now returns true
+  whenever a response is queued, which is every path. Same trap as the auth fix in 1.3.4.
+
 ## 1.7.2 — 2026-10-18
 
 ### Fixed

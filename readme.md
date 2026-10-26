@@ -224,6 +224,29 @@ Copy-paste examples for all three (as `#define`s or `build_flags`) are in
 `/sd/ls`, `/sd/tail/<f>`, `/sd/download/<f>`, `/sd/ren/<f>?to=<new>`,
 `/sd/del/<f>` (flat — no subfolders).
 
+### Tail window — `/tail/<f>`, `/sd/tail/<f>`
+
+| Query | Body |
+|---|---|
+| none | the last 8 KB |
+| `?bytes=N` | the last N bytes |
+| `?from=X` | from byte X to the end |
+| `?from=X&bytes=N` | N bytes starting at X |
+
+Every answer carries `X-File-Size` (the whole file) and `X-Tail-From` (the offset this
+body starts at) under an exact `Content-Length`. That is enough to follow a growing file:
+remember `X-File-Size` and next time ask `?from=<it>` — only the new bytes come back, and
+`from` at or past the end answers `200` with an empty body. If `X-File-Size` ever comes
+back smaller than what you remembered, the file was truncated or rotated: start over.
+
+The window is byte-exact, not line-aligned — the first line of a plain tail is usually
+partial, so drop it; a `from=` taken from a previous `X-File-Size` starts on a line
+boundary. A non-numeric `from`/`bytes` is a `400`. One answer is capped at
+`LIONWIFI_TAIL_MAX` (default 512 KB on ESP8266, 1 MB on ESP32): a tail keeps its end (`X-Tail-From` moves up), a
+`from=` keeps its start (continue from `X-Tail-From` + `Content-Length`). Both servers
+stream the window in chunks, so the cap bounds how long one request may hold the server
+(the sync one serves nobody else meanwhile), not memory.
+
 ### Preferred access point — `/aps`
 
 `/aps` scans and lists every point in the air (SSID, BSSID, channel, RSSI) and puts a
@@ -289,8 +312,6 @@ otherwise. SD listings are flat (root only — no subfolder navigation).
 - **State-changing routes use GET** (`/del…`, `/format`, `/restart`) and there is
   no CSRF token. Keep HTTP Basic auth enabled (don't set `NO_AUTH`) and/or run the
   device on a trusted network — treat the web UI as an admin console.
-- `tail` is for text/logs: it serves the last 8 KB as `text/plain`, so a binary
-  file's tail is truncated at the first NUL. Use **Download** for binary files.
 - Listed filenames longer than `LIONWIFI_NAME_MAX` bytes are truncated (and their
   links then 404); raise the flag for long UTF-8 names.
 
