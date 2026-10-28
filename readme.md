@@ -164,8 +164,9 @@ Override via `build_flags`. The full list lives in the header banner of
 | `NTP_TZ_OFFSET_SEC` / `NTP_SERVER` | `7*3600` / `pool.ntp.org` | Time zone offset / NTP host |
 | `WIFI_CONNECT_TIMEOUT` | `20000` | Per-AP attempt (ms) before rotating SSID |
 | `WIFI_FATAL_CONNECT_TIMEOUT` | `180000` | Reboot after this long disconnected (ms) |
-| `PING_ROUTER` | off | Router IP/host → enable ping-and-reboot watchdog |
+| `PING_ROUTER` | off | Ping target → enable ping-and-reboot watchdog; undefined = no ping. Pasted verbatim into `connect(PING_ROUTER, 80)` and evaluated on every ping, so it can be `IPAddress(…)`, a host string or an expression. **Recommended: `-D PING_ROUTER=WiFi.gatewayIP()`** — the DHCP gateway of whatever network the node joined, so one binary fits every site. With a static IP and no gateway that is `0.0.0.0` and the node reboot-loops; use a fixed address there |
 | `WIFI_BEST_AP` | off | Associate with the **strongest** point carrying the SSID, not the first one found. For meshes/extenders/a second router; costs a channel sweep (~2 s) per association attempt |
+| `LIONWIFI_WARM_RECONNECT` | off | ESP32, experimental: `Reconnect()` uses `disconnect(false)` and keeps the radio up instead of restarting WiFi. For an ESP32-C6 running Zigbee, where cold attempts lost the 4-way handshake |
 | `LIONWIFI_GARP_INTERVAL_MS` | `0` (off) | Broadcast a gratuitous ARP on association and every N ms, so the whole L2 domain learns which access point we are on. Also logs a silent roam. `120000` is a sane value |
 | `LIONWIFI_PREFERRED_AP_FILE` | `/wifi_ap.cfg` | Where the operator's preferred access point is stored (see `/aps`). Runtime choice, not a build flag — moving a node must not mean recompiling it |
 | `LIONWIFI_AP_SWITCH_DELAY_MS` | `500` | Grace period between answering `/aps/set` and actually re-associating, so the answer reaches the browser first |
@@ -181,8 +182,10 @@ Override via `build_flags`. The full list lives in the header banner of
 | `LIONWIFI_NAME_MAX` | 31 on SPIFFS w/o SD, else 63 | Max listed filename length (bytes). SPIFFS caps object names at 31, so a longer buffer is padding on every entry; raise for long LittleFS/SD names |
 | `LIONWIFI_LS_EXACT_ALLOC` | off | Count the directory first and allocate the listing array exactly once, instead of growing it by doubling (which keeps both buffers alive and roughly triples the peak). Costs a second directory walk — for heap-tight nodes |
 | `LIONWIFI_NO_ARDUINO_OTA` | off | Compile ArduinoOTA (espota) out — drops it and the mDNS responder it starts, ~34 KB of flash on ESP32. Use with `LIONWIFI_HTTP_OTA` |
+| `LIONWIFI_HEAP_LOG_MIN_MS` / `LIONWIFI_HEAP_LOG_MIN_DROP` | `8000` / `8192` | Throttle for the "====> heap" log line: a new minimum is logged only after this many ms since the last such line, or when it is this many bytes below the last logged value. A held-back minimum is logged once the window passes. Tags: ` DROP -<n>` = sharp fall, logged at once; ` held <n>s` = logged late, reached <n> s before the line's timestamp. Status page not affected. `MIN_MS=0` = log every new minimum |
 | `NO_MEMSTAT_IN_STATUS` | off | Drop heap/frag/stack stats from the status page (also the stack low-water tracking) |
-| `NO_WIFI_STAT_IN_STATUS` | off | Drop the WiFi RSSI/quality/channel line from the status page (shown by default) |
+| `NO_WIFI_STAT_IN_STATUS` | off | Drop the WiFi SSID/IP/RSSI/quality/channel line from the status page (shown by default) |
+| `NO_WIFI_IP_IN_STATUS` | off | Drop just the `IP <address>` field from that line |
 | `FS_BROWSER_CSS` | built-in | Replace the file-browser stylesheet (string literal) |
 | `NO_FS_BROWSER_CSS` | off | Drop the file-browser stylesheet — saves ~2 KB flash |
 

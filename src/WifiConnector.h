@@ -60,6 +60,19 @@
 //                            allocation — mind a node already short on heap.
 //                            Picks by SIGNAL, and signal is not path quality: it will
 //                            happily choose a loud point whose uplink is broken.
+//   LIONWIFI_WARM_RECONNECT  ESP32, EXPERIMENTAL. Reconnect() leaves the association
+//                            with WiFi.disconnect(false) and keeps the radio up, instead
+//                            of the default disconnect(true), which stops WiFi and
+//                            restarts it in begin(). The first attempt after boot is
+//                            cold either way. Why it exists: on an ESP32-C6 running a
+//                            Zigbee coordinator (27.10.2026), one access point lost
+//                            EAPOL msg 1 of the 4-way handshake on every cold attempt
+//                            (reason 204). The core's own immediate retry, which does
+//                            not stop the radio, completed the handshake 2 times out
+//                            of 2 — but a warm Reconnect() made with this flag lost it
+//                            too, once. So: a knob for experiments, NOT a known fix.
+//                            What did fix that node was starting Zigbee only after the
+//                            first WiFi connect (consumer side, not a library matter).
 //
 //   Preferred access point (runtime, no flag needed to enable):
 //   LIONWIFI_PREFERRED_AP_FILE  Where the operator's choice of access point lives
@@ -110,9 +123,25 @@
 //                            "CLOCK JUMPED -74 s (uptime +60s, clock +-14s) now 08:59:50".
 //
 //   Router ping watchdog (opt-in):
-//   PING_ROUTER              Router IP/host string — enables periodic TCP ping;
+//   PING_ROUTER              Ping target — enables periodic TCP ping (port 80);
 //                            reboots after PING_ROUTER_MAX_FAILURES (default 4)
 //                            misses, every PING_ROUTER_INTERVAL ms (default 30000).
+//                            Undefined = no ping at all (the watchdog is compiled out).
+//                            It is pasted verbatim into exactly ONE place,
+//                            connect(PING_ROUTER, 80), which runs only while associated,
+//                            so any expression connect() accepts will do and it is
+//                            evaluated afresh on every ping:
+//                              IPAddress(192, 168, 1, 1)   fixed address
+//                              "router.lan"                host name
+//                              WiFi.gatewayIP()            the gateway DHCP handed out —
+//                                                          RECOMMENDED: follows the network
+//                                                          the node actually joined, so one
+//                                                          binary works on every site and
+//                                                          nothing goes stale on a renumber.
+//                            In build_flags: -D PING_ROUTER=WiFi.gatewayIP() ; or a #define
+//                            in a header included BEFORE this one. Static IP config without
+//                            a gateway gives 0.0.0.0 — every ping fails and the node reboots;
+//                            use a fixed address there.
 //   PING_ROUTER_RECONNECT_AFTER  Re-associate after this many misses, before the reboot.
 //                            0 = off (default). Set below MAX_FAILURES. The point is the
 //                            state a reboot cannot fix — a stale client record on the AP;
@@ -142,9 +171,25 @@
 //   FS_SPACE_CHECK_INTERVAL_MS                Free-space / size watchdog tuning.
 //   HEAP_CHECK_INTERVAL_MS   Min gap between heap-stats samples (ESP8266, default
 //                            1000; getHeapStats walks the heap with IRQs off).
+//   LIONWIFI_HEAP_LOG_MIN_MS    Throttle for the "====> heap" line (new heap minimum).
+//   LIONWIFI_HEAP_LOG_MIN_DROP  A new minimum is logged only when at least MIN_MS (default
+//                            8000) have passed since the previous such line, OR when it
+//                            is at least MIN_DROP bytes (default 8192) below the last
+//                            LOGGED value. A minimum held back that way is logged later,
+//                            once the time window passes, so the true low-water mark
+//                            still reaches the log. Lines are tagged: " DROP -<n>" = a
+//                            sharp fall logged at once; " held <n>s" = logged late, the
+//                            minimum was reached <n> s before the line's timestamp.
+//                            Tracking itself is not throttled: the
+//                            status page and GetMinFreeMemory() always show the real
+//                            minimum. Why: at boot the heap sinks in ~100-byte steps, and
+//                            every step was a log line — 40+ in the first seconds on an
+//                            ESP32-C6 with Zigbee, flooding the async log queue.
+//                            MIN_MS=0 = the old behaviour, every new minimum is logged.
 //   NO_MEMSTAT_IN_STATUS     Drop heap/frag stats from the status page.
-//   NO_WIFI_STAT_IN_STATUS   Drop the WiFi RSSI/quality/channel line from the
+//   NO_WIFI_STAT_IN_STATUS   Drop the WiFi SSID/IP/RSSI/quality/channel line from the
 //                            status page (shown by default).
+//   NO_WIFI_IP_IN_STATUS     Drop just the "IP <address>" field from that line.
 //   LOG_FAVICON              Also log favicon.ico requests.
 //
 //   HTTP OTA (opt-in):
@@ -256,9 +301,16 @@
 #include <Array.h>
 
 #ifdef ESP32
-#include <esp32/rom/rtc.h>
+// Chip-neutral path: esp32/rom/rtc.h exists only for the classic ESP32 and breaks the
+// build on C6 (and any other target under IDF 5.x); rom/rtc.h resolves per target on
+// both Arduino 2.x and 3.x.
+#include <rom/rtc.h>
 #include <RtosTask.h>
 #include <esp_wifi.h>
+// Explicit: on Arduino-ESP32 2.x WiFi.h came in transitively through HTTPClient.h, but
+// 3.x moved HTTPClient onto NetworkClient and dropped that include — without this line
+// WiFi / WiFiClient / WL_CONNECTED are undeclared here and in every consumer.
+#include <WiFi.h>
 #include <HTTPClient.h>
 
 #ifdef NO_ASYNC_WEB_SERVER
@@ -267,9 +319,16 @@
 #include <ESPAsyncWebServer.h>
 #endif
 
-// FreeRTOS core the WiFi task is pinned to (ESP32 only).
+// FreeRTOS core the WiFi task is pinned to (ESP32 only). Single-core chips (C3, C6) have
+// only core 0: IDF 5.x asserts on a core id >= configNUMBER_OF_CORES when creating a
+// pinned task, so the default 1 would abort at startup there. On IDF 4.4 single-core
+// targets the id was effectively ignored, so 0 changes nothing for them.
 #ifndef CORE_WIFI
+#ifdef CONFIG_FREERTOS_UNICORE
+#define CORE_WIFI 0
+#else
 #define CORE_WIFI 1
+#endif
 #endif
 
 #else // No ESP32
@@ -356,6 +415,14 @@ extern "C"
 
 #ifndef PING_ROUTER_MAX_FAILURES
 #define PING_ROUTER_MAX_FAILURES 4
+#endif
+
+// Throttle for the heap-minimum log line — see the flag list at the top.
+#ifndef LIONWIFI_HEAP_LOG_MIN_MS
+#define LIONWIFI_HEAP_LOG_MIN_MS 8000ul
+#endif
+#ifndef LIONWIFI_HEAP_LOG_MIN_DROP
+#define LIONWIFI_HEAP_LOG_MIN_DROP 8192ul
 #endif
 
 // Re-associate after this many consecutive missed router pings, BEFORE giving up and
@@ -612,6 +679,11 @@ private:
     Array<String *> _ssids, _passwords;
     int _curApIdx = 0;
     uint32_t _minFreeMemory = 1000000; // seed high so the first heap sample always wins
+    uint32_t _minFreeMemoryTime = 0;            // millis() when _minFreeMemory was reached
+    uint32_t _minMaxAlloc = 0;                  // largest free block at that same moment
+    uint8_t _minFrag = 0;                       // ESP8266: fragmentation at that moment
+    uint32_t _loggedMinFreeMemory = 0xFFFFFFFF; // last minimum that made it into the log
+    uint32_t _lastHeapLogTime = 0;
     uint32_t _minFreeStack = 0xFFFFFFFF; // same, for the stack low-water mark
 #if defined(ESP32) && !defined(NO_WIFI_TASK)
     bool _loopFromSketchWarned = false; // warn once about an ignored Loop() from loop()
@@ -1206,11 +1278,14 @@ public:
         // Memory stats
         out.print(F("<div class='global-status memory-status'>"));
 #ifndef ESP32
+        // Casts to unsigned: uint32_t is `long unsigned` on RISC-V (C3/C6), and %u with it
+        // is a -Wformat warning in every consumer TU — same size, so harmless, but loud.
         out.printf_P(PSTR("Heap: <b>%u</b>B (loop min <b>%u</b>) | Frag: <b>%d%%</b> | Stack: <b>%u</b>B (min <b>%u</b>)"),
-                      freeHeap, _minFreeMemory, frag, freeStack, _minFreeStack);
+                      (unsigned)freeHeap, (unsigned)_minFreeMemory, frag, (unsigned)freeStack, (unsigned)_minFreeStack);
 #else
         out.printf_P(PSTR("Heap: <b>%u</b>B (min <b>%u</b>) | Largest: <b>%s</b> (%u%%) | Stack min: <b>%u</b>B"),
-                      freeHeap, _minFreeMemory, FsBrowser::FileSize(maxAlloc).c_str(), largestPct, _minFreeStack);
+                      (unsigned)freeHeap, (unsigned)_minFreeMemory, FsBrowser::FileSize(maxAlloc).c_str(),
+                      (unsigned)largestPct, (unsigned)_minFreeStack);
 #endif
         out.print(F("</div>"));
 #endif
@@ -1227,8 +1302,15 @@ public:
             else if (rssi >= -75) { rq = F("ok");              rcolor = "green"; }
             else if (rssi >= -82) { rq = F("weak, OTA slow");  rcolor = "orange"; }
             else                  { rq = F("POOR, OTA fails"); rcolor = "red"; }
-            out.printf_P(PSTR("<div class='global-status wifi-status'><span>WiFi <b>%s</b></span>&nbsp;<span>RSSI <b>%d</b> dBm &mdash; <b style='color:%s'>%S</b></span>&nbsp;<span>ch <b>%d</b></span>"),
-                         WiFi.SSID().c_str(), rssi, rcolor, rq, WiFi.channel());
+            out.printf_P(PSTR("<div class='global-status wifi-status'><span>WiFi <b>%s</b></span>"),
+                         WiFi.SSID().c_str());
+#ifndef NO_WIFI_IP_IN_STATUS
+            // The page is usually reached by NAME (hosts file, mDNS, a link from another
+            // page), so the address it answers on is otherwise nowhere to be seen.
+            out.printf_P(PSTR("&nbsp;<span>IP <b>%s</b></span>"), WiFi.localIP().toString().c_str());
+#endif
+            out.printf_P(PSTR("&nbsp;<span>RSSI <b>%d</b> dBm &mdash; <b style='color:%s'>%S</b></span>&nbsp;<span>ch <b>%d</b></span>"),
+                         rssi, rcolor, rq, (int)WiFi.channel());
 #ifndef NO_WIFI_BSSID_IN_STATUS
             // WHICH point, not just how loud. Where several share the SSID, the RSSI alone
             // cannot tell "the near one is weak today" from "we are on the far one again",
@@ -2067,25 +2149,66 @@ private:
             uint32_t hfree, hmax;
             uint8_t hfrag;
             ESP.getHeapStats(&hfree, &hmax, &hfrag);
-            if (hfree < _minFreeMemory)
-            {
-                _minFreeMemory = hfree;
-                Logger.Log_P(ILogger::LvlInfo, PSTR("====> New free heap = %lu (max %lu, frag %d)"), (unsigned long)_minFreeMemory, (unsigned long)hmax, hfrag);
-            }
+            NoteHeapSample(hfree, hmax, hfrag);
+            char tag[24];
+            if (HeapLogDue(tag, sizeof(tag)))
+                Logger.Log_P(ILogger::LvlInfo, PSTR("====> New free heap = %lu (max %lu, frag %d)%s"), (unsigned long)_minFreeMemory, (unsigned long)_minMaxAlloc, _minFrag, tag);
             TrackStackLowWater();
         }
 #else
         uint32_t free = ESP.getFreeHeap();
         uint32_t maxAlloc = ESP.getMaxAllocHeap();
 
-        if (free < _minFreeMemory)
-        {
-            _minFreeMemory = free;
-            Logger.Log_P(ILogger::LvlInfo, PSTR("====> heap = %lu (max %lu)"), (unsigned long)_minFreeMemory, (unsigned long)maxAlloc);
-        }
+        NoteHeapSample(free, maxAlloc);
+        char tag[24];
+        if (HeapLogDue(tag, sizeof(tag)))
+            Logger.Log_P(ILogger::LvlInfo, PSTR("====> heap = %lu (max %lu)%s"), (unsigned long)_minFreeMemory, (unsigned long)_minMaxAlloc, tag);
         TrackStackLowWater();
         vTaskDelay(1);
 #endif
+    }
+
+    // Track a heap sample: the minimum itself is never throttled, only its log line.
+    // Largest block and fragmentation are remembered FROM THE SAME SAMPLE: a held line
+    // printed with the current ones put "max" above "heap" (heap = 164444 (max 172020)),
+    // two numbers from different moments side by side.
+    void NoteHeapSample(uint32_t freeNow, uint32_t maxNow, uint8_t fragNow = 0)
+    {
+        if (freeNow < _minFreeMemory)
+        {
+            _minFreeMemory = freeNow;
+            _minFreeMemoryTime = millis();
+            _minMaxAlloc = maxNow;
+            _minFrag = fragNow;
+        }
+    }
+
+    // Is the current heap minimum worth a log line now? See LIONWIFI_HEAP_LOG_MIN_MS at the
+    // top. Marks it logged when it says yes and fills `tag` with why, so a reader can tell
+    // the two kinds apart:
+    //   " DROP -<n>"  logged at once: <n> bytes below the previous logged line;
+    //   " held <n>s"  logged late: the minimum was reached <n> s ago and waited out the
+    //                 throttle window — the line's timestamp is NOT when it happened.
+    // Empty tag = the very first sample, or a minimum logged the moment it was reached.
+    bool HeapLogDue(char *tag, size_t tagSize)
+    {
+        tag[0] = 0;
+        if (_minFreeMemory >= _loggedMinFreeMemory)
+            return false; // nothing new below what the log already has
+        uint32_t now = millis();
+        bool first = _loggedMinFreeMemory == 0xFFFFFFFF;
+        bool timeOk = first || now - _lastHeapLogTime >= LIONWIFI_HEAP_LOG_MIN_MS;
+        uint32_t drop = first ? 0 : _loggedMinFreeMemory - _minFreeMemory;
+        bool dropOk = !first && drop >= LIONWIFI_HEAP_LOG_MIN_DROP;
+        if (!timeOk && !dropOk)
+            return false;
+        if (dropOk)
+            snprintf(tag, tagSize, " DROP -%lu", (unsigned long)drop);
+        else if (!first && now - _minFreeMemoryTime >= 1000)
+            snprintf(tag, tagSize, " held %lus", (unsigned long)((now - _minFreeMemoryTime) / 1000));
+        _loggedMinFreeMemory = _minFreeMemory;
+        _lastHeapLogTime = now;
+        return true;
     }
 
     // Lowest free stack seen so far, logged whenever it drops. The status page shows the
@@ -2602,7 +2725,13 @@ protected:
         // powering the radio down (disconnect(true) = wifioff) on a path that works.
         ApplyRadioSettings();
         WiFi.persistent(false);
+#ifdef LIONWIFI_WARM_RECONNECT
+        // Opt-in experiment, see the flag list at the top. Still aborts the running
+        // attempt (the endless-ladder fix above needs only that), but the radio stays up.
+        WiFi.disconnect(false);
+#else
         WiFi.disconnect(true); // true = radio off; begin() below brings it back up
+#endif
 #endif
         BeginStation();
     }

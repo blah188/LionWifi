@@ -3,6 +3,47 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.9.0 — 2026-10-28
+
+### Added
+- **Own IP address on the status page** — `IP <address>` in the WiFi line, right after the
+  SSID. Shown by default; `-D NO_WIFI_IP_IN_STATUS` drops it. Pages are usually reached by
+  name, so the address was nowhere to be seen.
+- **`LIONWIFI_WARM_RECONNECT`** (ESP32, experimental, off by default). `Reconnect()` drops
+  the association without stopping the radio. Added for an ESP32-C6 running a Zigbee
+  coordinator, where cold attempts kept losing EAPOL msg 1 on one access point. A knob for
+  experiments, not a known fix: a warm attempt there lost the handshake too.
+
+### Changed
+- **The "====> heap" line is throttled by default.** A new heap minimum is logged only if
+  `LIONWIFI_HEAP_LOG_MIN_MS` (8000) have passed since the last such line, or if it is
+  `LIONWIFI_HEAP_LOG_MIN_DROP` (8192) bytes below the last logged value. A held-back
+  minimum is logged once the window passes. Lines are tagged: ` DROP -<n>` for a sharp
+  fall logged at once, ` held <n>s` for a minimum reached <n> s before the line's
+  timestamp. The largest free block (and fragmentation on ESP8266) in the line come from
+  the same sample as the minimum. The status page and `GetMinFreeMemory()` are
+  not throttled. `-D LIONWIFI_HEAP_LOG_MIN_MS=0` restores the old line-per-minimum. Reason:
+  at boot the heap sinks in ~100-byte steps, and an ESP32-C6 running Zigbee logged 40+ such
+  lines in its first seconds, overflowing the async log queue.
+- **`PING_ROUTER` documented as an expression, `WiFi.gatewayIP()` recommended.** Nothing
+  changed in the code: the macro was always pasted into exactly one `connect(PING_ROUTER, 80)`
+  that runs only while associated, so `-D PING_ROUTER=WiFi.gatewayIP()` already pinged the
+  DHCP gateway of whatever network the node joined. Fixed addresses and host strings work as
+  before; undefined still means no watchdog.
+- `CORE_WIFI` defaults to `0` on single-core chips (`CONFIG_FREERTOS_UNICORE`: C3, C6).
+  IDF 5.x rejects a pinned task on a core that does not exist; on IDF 4.4 single-core the id
+  was effectively ignored, so nothing changes there.
+
+### Fixed
+- **Builds on Arduino-ESP32 3.x / espressif32 8.0 (checked on ESP32-C6).**
+  `esp32/rom/rtc.h` exists only for the classic ESP32 → the chip-neutral `rom/rtc.h`. And
+  `WiFi.h` is now included explicitly: 3.x moved `HTTPClient` onto `NetworkClient`, which no
+  longer pulls it in, leaving `WiFi`/`WiFiClient`/`WL_CONNECTED` undeclared.
+- `-Wformat` warnings on RISC-V (C3/C6) from the status-page memory line: `uint32_t` is
+  `long unsigned` there; the values are now cast for `%u`. The `%S` warnings that remain
+  are false — `%S` with `F()` works on ESP32 — and are not touched. Also `-Wparentheses`
+  on the three `while (file = dir.openNextFile())` loops (double parentheses now).
+
 ## 1.8.0 — 2026-10-26
 
 ### Added

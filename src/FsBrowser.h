@@ -1128,7 +1128,7 @@ public:
 #ifdef ESP32
             File cdir = LIONWIFI_FS.open("/");
             File cf;
-            while (cf = cdir.openNextFile())
+            while ((cf = cdir.openNextFile())) // double parens: assignment on purpose
             {
                 LIONWIFI_WDT_FEED();
                 count++;
@@ -1146,7 +1146,7 @@ public:
 #ifdef ESP32
         File dir = LIONWIFI_FS.open("/");
         File file;
-        while (file = dir.openNextFile())
+        while ((file = dir.openNextFile())) // double parens: assignment on purpose
 #else // ESP8266 uses the Dir iterator API
         Dir dir = LIONWIFI_FS.openDir("/");
         while (dir.next())
@@ -1201,7 +1201,7 @@ public:
 #else
         File root = SD.open("/");
         File file;
-        while (file = root.openNextFile())
+        while ((file = root.openNextFile())) // double parens: assignment on purpose
         {
 #ifdef ESP32
             LIONWIFI_WDT_FEED();
