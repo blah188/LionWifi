@@ -3,6 +3,25 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.9.1 — 2026-11-11
+
+### Fixed
+- **An interrupted HTTP OTA upload no longer breaks the next one.** A client that dropped
+  mid-upload left the Updater "running": the next `begin()` was refused (the result was
+  not checked), and the new upload's chunks were appended to the stale one until the
+  partition overflowed. Now a new upload first drops an unfinished update; the async
+  server also drops it as soon as the client disconnects (it gives no final chunk), the
+  sync servers on `UPLOAD_FILE_ABORTED`. Either way the app's OTA end hook is called with
+  `false`, so an OTA indicator does not stay on.
+- **The upload's verdict counts a refused `begin()`.** It left no error in the Updater, so
+  the response could say "Update OK" and reboot into the old firmware.
+
+### Changed
+- **HTTP OTA errors are logged once, with the reason.** `HTTP OTA: begin|write|end failed:
+  <Updater error>` (on ESP8266 cores without an error string: the error code), then the
+  rest of the upload is skipped. Before: one bare `HTTP OTA: short write` per chunk — 844
+  lines for one failed upload on an ESP32-C6.
+
 ## 1.9.0 — 2026-10-28
 
 ### Added

@@ -718,6 +718,9 @@ private:
 #endif
 #ifdef LIONWIFI_HTTP_OTA
     bool _httpOtaAuthOk = false; // latched when the upload starts; response gated on it
+    // This upload already failed (begin, a write or end): logged once, later chunks are
+    // dropped instead of producing one "short write" line each (844 of them on a C6).
+    bool _httpOtaFailed = false;
 #endif
 #if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
     // Deadline for the fallback reboot; 0 = none pending. See scheduleReboot().
@@ -1328,6 +1331,94 @@ public:
     }
 
 #ifdef LIONWIFI_HTTP_OTA
+    // Why the Updater refused. ESP8266 cores before 3.x have no error string, only the code.
+    void httpOtaLogError(const char *what)
+    {
+#ifdef ESP32
+        Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: %s failed: %s"), what, Update.errorString());
+#else
+        Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: %s failed, Update error %u"), what, (unsigned)Update.getError());
+#endif
+        _httpOtaFailed = true;
+    }
+
+    // Drop an update that was begun and never finished. A client that vanishes mid-upload
+    // (the async server gives no final chunk then) leaves the Updater "running": the next
+    // begin() refuses, and that upload's chunks get appended to the stale one — on a C6
+    // three attempts piled past the 4 MB slot and every write failed (11.11.2026).
+    void httpOtaDropStale(const char *why)
+    {
+        if (!Update.isRunning())
+            return;
+#ifdef ESP32
+        Update.abort();
+#else
+        Update.end(false); // unfinished → the core resets the Updater (there is no abort())
+#endif
+        Logger.Log_P(ILogger::LvlWarning, PSTR("HTTP OTA: unfinished update dropped (%s)"), why);
+    }
+
+    // First chunk: clear what an earlier upload left, open the update.
+    void httpOtaBegin(bool fs, const char *filename)
+    {
+        _httpOtaFailed = false;
+        httpOtaDropStale("new upload");
+        Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: start %s (%s)"), filename, fs ? "FS" : "sketch");
+        if (_otaStartEvent) _otaStartEvent(!fs); // sketchUpload = !fs
+        bool ok;
+        if (fs)
+        {
+            LIONWIFI_FS.end(); // unmount before writing the FS partition
+#ifdef ESP32
+            ok = Update.begin(UPDATE_SIZE_UNKNOWN, U_SPIFFS);
+#else
+            ok = Update.begin((size_t)FS_end - (size_t)FS_start, U_FS);
+#endif
+        }
+        else
+        {
+#ifdef ESP32
+            ok = Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+#else
+            ok = Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000, U_FLASH);
+#endif
+        }
+        if (!ok)
+            httpOtaLogError("begin");
+    }
+
+    void httpOtaWrite(uint8_t *data, size_t len)
+    {
+        if (_httpOtaFailed)
+            return;
+        if (Update.write(data, len) != len)
+            httpOtaLogError("write");
+    }
+
+    void httpOtaEnd(size_t total)
+    {
+        if (_httpOtaFailed)
+        {
+            httpOtaDropStale("upload failed"); // whatever begin() managed to open
+            return;
+        }
+        if (Update.end(true))
+            Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: %u bytes, OK"), (unsigned int)total);
+        else
+            httpOtaLogError("end");
+    }
+
+    // The client went away before the last chunk: close the update now instead of leaving
+    // it for the next upload to find, and let the app know (its OTA indicator is on).
+    void httpOtaAborted()
+    {
+        if (!Update.isRunning())
+            return;
+        httpOtaDropStale("client gone mid-upload");
+        _httpOtaFailed = true;
+        if (_otaEndEvent) _otaEndEvent(false);
+    }
+
     // Registers /update: GET shows an upload form, POST flashes the firmware and
     // reboots. FORWARD upload (curl/browser → device), so it works across NAT /
     // subnets where ArduinoOTA's reverse connection can't reach back. HTTP Basic
@@ -1345,7 +1436,8 @@ public:
             [this](AsyncWebServerRequest *request)
             {
                 if (!_httpOtaAuthOk) { request->requestAuthentication(); return; }
-                bool ok = !Update.hasError();
+                // Our own flag first: a refused begin() leaves no error in the Updater.
+                bool ok = !_httpOtaFailed && !Update.hasError();
                 if (_otaEndEvent) _otaEndEvent(ok);
                 AsyncWebServerResponse *resp = request->beginResponse(200, __text_plain__F, ok ? F("Update OK - rebooting") : F("Update FAILED"));
                 resp->addHeader(F("Connection"), F("close"));
@@ -1374,31 +1466,19 @@ public:
                     _httpOtaAuthOk = request->authenticate(WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
 #endif
                     if (!_httpOtaAuthOk) return; // reject unauthenticated uploads outright
-                    bool fs = request->hasParam("fs"); // ?fs=1 → flash a filesystem image
-                    Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: start %s (%s)"), filename.c_str(), fs ? "FS" : "sketch");
-                    if (_otaStartEvent) _otaStartEvent(!fs); // sketchUpload = !fs
-                    if (fs)
-                    {
-                        LIONWIFI_FS.end(); // unmount before writing the FS partition
-                        Update.begin(UPDATE_SIZE_UNKNOWN, U_SPIFFS);
-                    }
-                    else
-                        Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
+                    httpOtaBegin(request->hasParam("fs"), filename.c_str()); // ?fs=1 → filesystem image
+                    // No final chunk comes if the client drops mid-upload. The success path
+                    // above replaces this handler with the reboot one (one per request).
+                    request->onDisconnect([this]() { httpOtaAborted(); });
                 }
                 if (!_httpOtaAuthOk) return;
-                if (Update.write(data, len) != len)
-                    Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
+                httpOtaWrite(data, len);
                 // total = the length of the POST, which is slightly more than the binary
                 // (multipart wrapping, under 1%) but gives an honest percentage —
                 // Update.begin() was called with SIZE_UNKNOWN and knows nothing.
                 if (_otaProgressEvent) _otaProgressEvent((unsigned int)(index + len), (unsigned int)request->contentLength());
                 if (final)
-                {
-                    if (Update.end(true))
-                        Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: %u bytes, OK"), (unsigned int)(index + len));
-                    else
-                        Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: end failed"));
-                }
+                    httpOtaEnd(index + len);
             });
 #else // sync server (ESP8266 / ESP32 core WebServer) — hand-rolled for uniform logs + hooks
         server.on(F("/update"), HTTP_GET, [this]()
@@ -1410,7 +1490,7 @@ public:
             [this]() // onRequest: runs after the upload — send result + reboot
             {
                 if (!_httpOtaAuthOk) { server.requestAuthentication(); return; }
-                bool ok = !Update.hasError();
+                bool ok = !_httpOtaFailed && !Update.hasError();
                 if (_otaEndEvent) _otaEndEvent(ok);
                 server.send(200, __text_plain__F, ok ? F("Update OK - rebooting") : F("Update FAILED"));
                 delay(100);
@@ -1427,31 +1507,11 @@ public:
                     _httpOtaAuthOk = server.authenticate(WEB_SERVER_AUTH_USER, WEB_SERVER_AUTH_PASSWORD);
 #endif
                     if (!_httpOtaAuthOk) return; // reject unauthenticated uploads outright
-                    bool fs = server.hasArg("fs") || up.name == "filesystem"; // FS-image target
-                    Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: start %s (%s)"), up.filename.c_str(), fs ? "FS" : "sketch");
-                    if (_otaStartEvent) _otaStartEvent(!fs); // sketchUpload = !fs
-                    if (fs)
-                    {
-                        LIONWIFI_FS.end(); // unmount before writing the FS partition
-#ifdef ESP32
-                        Update.begin(UPDATE_SIZE_UNKNOWN, U_SPIFFS);
-#else
-                        Update.begin((size_t)FS_end - (size_t)FS_start, U_FS);
-#endif
-                    }
-                    else
-                    {
-#ifdef ESP32
-                        Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH);
-#else
-                        Update.begin((ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000, U_FLASH);
-#endif
-                    }
+                    httpOtaBegin(server.hasArg("fs") || up.name == "filesystem", up.filename.c_str()); // FS-image target
                 }
                 else if (up.status == UPLOAD_FILE_WRITE && _httpOtaAuthOk)
                 {
-                    if (Update.write(up.buf, up.currentSize) != up.currentSize)
-                        Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: short write"));
+                    httpOtaWrite(up.buf, up.currentSize);
                     // total = the length of the POST (multipart wrapping skews it by <1%).
 #ifdef ESP32
                     if (_otaProgressEvent) _otaProgressEvent((unsigned int)up.totalSize, (unsigned int)server.clientContentLength());
@@ -1462,12 +1522,10 @@ public:
 #endif
                 }
                 else if (up.status == UPLOAD_FILE_END && _httpOtaAuthOk)
-                {
-                    if (Update.end(true))
-                        Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA: %u bytes, OK"), (unsigned int)up.totalSize);
-                    else
-                        Logger.Log_P(ILogger::LvlError, PSTR("HTTP OTA: end failed"));
-                }
+                    httpOtaEnd(up.totalSize);
+                // Client dropped mid-upload: the sync servers do report it, unlike the async one.
+                else if (up.status == UPLOAD_FILE_ABORTED && _httpOtaAuthOk)
+                    httpOtaAborted();
             });
 #endif
         Logger.Log_P(ILogger::LvlInfo, PSTR("HTTP OTA ready at /update"));
