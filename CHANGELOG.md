@@ -3,6 +3,34 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.10.0 — 2026-11-12
+
+### Added
+- **PSRAM on the status page.** `ESP.getFreeHeap()`, `getMaxAllocHeap()` and
+  `getMinFreeHeap()` all report `MALLOC_CAP_INTERNAL` — internal RAM only, in both
+  Arduino 2.0.17 and 3.3.12 — so on a board with external RAM the page hid megabytes of
+  usable memory (an ESP32-S2 hub showed "Heap 51K" with 2.0M sitting next to it). When
+  `psramFound()`, the memory line now also carries `PSRAM: free of total (min) | Largest`,
+  plus whether plain `malloc` reaches it (`in malloc from <threshold>`, taken from the
+  core's `SPIRAM_USE_MALLOC`/`SPIRAM_MALLOC_ALWAYSINTERNAL`, or `caps-alloc only`).
+  Deliberately a separate figure, not added to Heap: internal RAM is the scarce resource,
+  and a roomy-looking total is how you miss it running out. A board that declares
+  `BOARD_HAS_PSRAM` but finds none says so instead of staying silent — otherwise a bad
+  joint looks exactly like a chip that never had external RAM. Nothing changes on ESP8266
+  or on chips without PSRAM support. The minimum is printed only when non-zero:
+  `heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM)` returns 0 on ESP32-S2 (core 3.3.12,
+  IDF 5.5) with 2.0M free and a 2015k largest block, i.e. it is not tracked there, and
+  showing it would claim PSRAM had been exhausted when it had not. The malloc threshold is
+  **measured**, not read from `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`: an application can move
+  it at runtime with `heap_caps_malloc_extmem_enable()` and IDF exposes no getter, so the
+  compile-time constant said 4096 while the live limit was 128. The page now probes by
+  doubling from 32 B and reports the bracket the limit falls into — the largest size that
+  came back internal and the smallest that came back external — because doubling cannot land
+  on the limit itself (needs `esp_ptr_external_ram`, taken from `esp_memory_utils.h` on
+  Arduino 3.x and `soc/soc_memory_types.h` on 2.x). A bracket below the configured limit is
+  a useful signal rather than a probe bug: once internal RAM runs short the allocator spills
+  small requests outside too.
+
 ## 1.9.1 — 2026-11-11
 
 ### Fixed

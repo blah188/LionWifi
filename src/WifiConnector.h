@@ -312,6 +312,16 @@
 // WiFi / WiFiClient / WL_CONNECTED are undeclared here and in every consumer.
 #include <WiFi.h>
 #include <HTTPClient.h>
+// esp_ptr_external_ram(): отвечает, во внешней ли памяти лежит указатель. Нужен статусной
+// странице, чтобы НЕ врать про PSRAM (см. StatusHtml). Заголовок переехал между ядрами:
+// на Arduino 3.x (IDF 5.x) это esp_memory_utils.h, на 2.x — soc/soc_memory_types.h.
+#if __has_include(<esp_memory_utils.h>)
+#include <esp_memory_utils.h>
+#define LIONWIFI_HAS_PTR_EXTRAM 1
+#elif __has_include(<soc/soc_memory_types.h>)
+#include <soc/soc_memory_types.h>
+#define LIONWIFI_HAS_PTR_EXTRAM 1
+#endif
 
 #ifdef NO_ASYNC_WEB_SERVER
 #include <WebServer.h>
@@ -1289,6 +1299,96 @@ public:
         out.printf_P(PSTR("Heap: <b>%u</b>B (min <b>%u</b>) | Largest: <b>%s</b> (%u%%) | Stack min: <b>%u</b>B"),
                       (unsigned)freeHeap, (unsigned)_minFreeMemory, FsBrowser::FileSize(maxAlloc).c_str(),
                       (unsigned)largestPct, (unsigned)_minFreeStack);
+
+        // External RAM, shown SEPARATELY — deliberately not folded into the Heap figure.
+        //
+        // Why it has to be shown at all: ESP.getFreeHeap(), getMaxAllocHeap() and
+        // getMinFreeHeap() all report heap_caps_*(MALLOC_CAP_INTERNAL), i.e. internal RAM
+        // only. Checked in both cores this library is built against (Esp.cpp of Arduino
+        // 2.0.17 and of 3.3.12 — identical in this respect), so no version guard is needed.
+        // Without the block below, two megabytes of usable memory simply do not appear on
+        // the page: an ESP32-S2 hub reported "Heap 51K" while 2.0M sat right next to it.
+        //
+        // Why not one number: summing them would be worse than useless. Internal RAM is the
+        // scarce resource — TCP control blocks, task stacks and every allocation below the
+        // malloc threshold can live nowhere else — and a roomy-looking total is exactly how
+        // you fail to notice it running out.
+        //
+        // The PSRAM API (psramFound, getPsramSize, getFreePsram, getMinFreePsram,
+        // getMaxAllocPsram) exists in both cores as well, so this needs no ifdef either. On
+        // a chip with no external-RAM support (ESP32-C3 and friends) psramFound() is false
+        // and nothing is printed.
+        if (psramFound())
+        {
+            out.printf_P(PSTR(" | PSRAM: <b>%s</b> of <b>%s</b>"),
+                         FsBrowser::FileSize(ESP.getFreePsram()).c_str(),
+                         FsBrowser::FileSize(ESP.getPsramSize()).c_str());
+            // Минимум — ТОЛЬКО если он непустой. `ESP.getMinFreePsram()` это
+            // heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), и на ESP32-S2 (ядро
+            // 3.3.12, IDF 5.5) он отдаёт ноль при двух свободных мегабайтах и крупнейшем
+            // блоке в 2015 КБ — то есть не водяной знак, а «не ведётся». Печатать его
+            // значило бы писать «PSRAM кончалась под ноль» там, где этого не было:
+            // ложная тревога хуже отсутствующей цифры. Появится настоящий минимум —
+            // покажется сам, без правки кода.
+            uint32_t psMin = ESP.getMinFreePsram();
+            if (psMin)
+                out.printf_P(PSTR(" (min <b>%s</b>)"), FsBrowser::FileSize(psMin).c_str());
+            out.printf_P(PSTR(" | Largest: <b>%s</b>"),
+                         FsBrowser::FileSize(ESP.getMaxAllocPsram()).c_str());
+            // Does plain malloc/new reach it, and from which size? That decides whether the
+            // figure above is spare room for ordinary code or a pool nobody asks for.
+            //
+            // MEASURED, not read off a #define. The first version printed
+            // CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL and was wrong the moment it mattered: the
+            // application can move that threshold at runtime with
+            // heap_caps_malloc_extmem_enable(), IDF exposes no getter for it, and the page
+            // then claimed 4096 while the live limit was 128 (ESP32-S2 hub, 12.11.2026).
+            //
+            // So: probe. Doubling from 32 B, report the first size that lands outside. One
+            // malloc/free per step, up to nine, freed immediately — a status page is not a
+            // hot path. Note the threshold means allocations SMALLER than it stay internal,
+            // so a single probe size cannot tell you anything: 64 B is internal under both
+            // a 128 and a 4096 limit.
+            //
+            // Both ends are printed, because one is not enough: doubling cannot land on the
+            // limit itself, so the honest answer is the bracket it falls into. Measured on
+            // the ESP32-S2 hub with the limit at 128: 128 B came back internal and 256 B
+            // external, which also settles what the IDF header leaves open ("below which")
+            // — the comparison is NOT strict, size <= limit stays internal.
+            //
+            // A boundary lower than the configured limit is not a bug in the probe: when
+            // internal memory runs out, the allocator spills small requests outside too —
+            // and that is worth seeing on the page, since it is the first sign of pressure.
+#ifdef LIONWIFI_HAS_PTR_EXTRAM
+            size_t extFrom = 0, lastInternal = 0;
+            for (size_t n = 32; n <= 8192 && !extFrom; n <<= 1)
+            {
+                void *probe = malloc(n);
+                if (!probe)
+                    break; // под давлением не выпрашиваем — просто не показываем границу
+                if (esp_ptr_external_ram(probe))
+                    extFrom = n;
+                else
+                    lastInternal = n;
+                free(probe);
+            }
+            if (extFrom && lastInternal)
+                out.printf_P(PSTR(" | malloc: <b>%u</b>B internal, <b>%u</b>B external"),
+                             (unsigned)lastInternal, (unsigned)extFrom);
+            else if (extFrom)
+                out.printf_P(PSTR(" | malloc: <b>%u</b>B external"), (unsigned)extFrom);
+            else
+                out.print(F(" | malloc: internal only"));
+#endif
+        }
+#ifdef BOARD_HAS_PSRAM
+        // The board declares external RAM and the runtime did not find it. Said out loud on
+        // purpose: silence here looks exactly like a chip that never had any, and the
+        // difference matters — a bad joint, wrong pins, or a core not built for that mode.
+        // Costs one branch, and only on boards that claim PSRAM in the first place.
+        else
+            out.print(F(" | PSRAM: <b>declared but not found</b>"));
+#endif
 #endif
         out.print(F("</div>"));
 #endif
