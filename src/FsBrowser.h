@@ -13,21 +13,29 @@
 // FsBrowser.cpp (the comparator, the shared PROGMEM MIME strings).
 // =============================================================================
 
-// Keeps the long loops below (directory scans, the chunked listing) watchdog-safe. Two
-// different watchdogs, so two measures:
-//   * rtc_wdt_feed() pokes the RTC one. soc/rtc_wdt.h exists only for the original ESP32 —
-//     on a RISC-V target (C3, C6, ...) it does not even link — hence the target check.
-//   * vTaskDelay(1) yields to the idle task, which is what the TASK watchdog actually
-//     watches; poking anything would not satisfy it. Needed on every ESP32 target: do not
-//     assume our code sits on the core whose idle is unwatched, CORE_WIFI is a build flag
-//     and a consumer can put this very task on core 0, where a long scan would starve the
-//     watched idle task into a panic (5 s, CONFIG_ESP_TASK_WDT_PANIC=y).
-// One tick is 1 ms at the Arduino default of 1000 Hz, paid per directory entry / per chunk.
-// ESP8266 never called this and still does not: its loops are pumped differently.
-#if defined(ESP32) && defined(CONFIG_IDF_TARGET_ESP32)
-#include "soc/rtc_wdt.h"
-#define LIONWIFI_WDT_FEED() do { rtc_wdt_feed(); vTaskDelay(1); } while (0)
-#elif defined(ESP32)
+// Keeps the long loops below (directory scans, the chunked listing) watchdog-safe.
+//
+// The watchdog that can actually bite here is the TASK one, and vTaskDelay(1) is the only
+// thing that satisfies it: it watches whether the idle task gets to run, so poking a
+// counter would not help. Needed on every ESP32 target — do not assume our code sits on
+// the core whose idle is unwatched: CORE_WIFI is a build flag, and a consumer can put this
+// very task on core 0, where a long scan would starve the watched idle task into a panic
+// (5 s, CONFIG_ESP_TASK_WDT_PANIC=y). One tick is 1 ms at the Arduino default of 1000 Hz,
+// paid per directory entry / per chunk. ESP8266 never called this and still does not: its
+// loops are pumped differently.
+//
+// Up to 1.10.0 this macro also called rtc_wdt_feed() on the original ESP32, inherited from
+// the pre-library code. That was medicine for a disease that is not there: the RTC watchdog
+// is armed by the bootloader to catch a hang during boot, and ESP-IDF startup disables it
+// again "immediately before the user's main function" unless
+// CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE is set. It is not set in any Arduino core
+// (checked in the prebuilt sdkconfig of both 2.0.17 and 3.3.12), and a consumer cannot set
+// it either, because Arduino ships that sdkconfig prebuilt — there is no menuconfig. So the
+// call ticked a stopped timer. Dropping it also removes a chip-specific include that broke
+// the build on Arduino 3.x: there the header is a flat "rtc_wdt.h", not "soc/rtc_wdt.h",
+// and it exists for ESP32/S2 only (the API is declared under CONFIG_IDF_TARGET_ESP32 ||
+// CONFIG_IDF_TARGET_ESP32S2). Enable that option and feeding the RTC watchdog is yours.
+#ifdef ESP32
 #define LIONWIFI_WDT_FEED() vTaskDelay(1)
 #else
 #define LIONWIFI_WDT_FEED() ((void)0)

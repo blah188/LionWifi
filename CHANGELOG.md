@@ -3,6 +3,27 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.10.1 — 2026-11-14
+
+### Fixed
+- **Builds again on the original ESP32 under Arduino-ESP32 3.x.** `FsBrowser.h` included
+  `"soc/rtc_wdt.h"`, which exists under that path only in Arduino 2.x; the 3.x package ships
+  it flat as `rtc_wdt.h`, so every consumer `.cpp` died with `fatal error: soc/rtc_wdt.h: No
+  such file or directory`. Only the original ESP32 was affected — the include sat behind
+  `CONFIG_IDF_TARGET_ESP32`, so C3/C6/S2 never compiled it, and the breakage stayed hidden
+  until the first esp32dev build on the new core.
+
+### Removed
+- **The `rtc_wdt_feed()` call in `LIONWIFI_WDT_FEED()`** (the fix above is a side effect of
+  this). It fed a watchdog that is not running: the bootloader arms the RTC watchdog to catch
+  a hang during boot, and ESP-IDF startup disables it again immediately before the user's main
+  function unless `CONFIG_BOOTLOADER_WDT_DISABLE_IN_USER_CODE` is set — which no Arduino core
+  sets, and no consumer can set, since Arduino ships `sdkconfig` prebuilt. The macro now
+  expands to `vTaskDelay(1)` on every ESP32 target, which is what the directory scans needed
+  all along: the watchdog that can bite there is the TASK one, and it watches whether the idle
+  task gets to run, so no amount of poking would have satisfied it. ESP8266 is unchanged (the
+  macro was, and stays, empty there).
+
 ## 1.10.0 — 2026-11-12
 
 ### Added
