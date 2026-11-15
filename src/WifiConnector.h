@@ -312,9 +312,9 @@
 // WiFi / WiFiClient / WL_CONNECTED are undeclared here and in every consumer.
 #include <WiFi.h>
 #include <HTTPClient.h>
-// esp_ptr_external_ram(): отвечает, во внешней ли памяти лежит указатель. Нужен статусной
-// странице, чтобы НЕ врать про PSRAM (см. StatusHtml). Заголовок переехал между ядрами:
-// на Arduino 3.x (IDF 5.x) это esp_memory_utils.h, на 2.x — soc/soc_memory_types.h.
+// esp_ptr_external_ram(): tells whether a pointer lives in external memory. The status
+// page needs it so it does not lie about PSRAM (see StatusHtml). The header moved between
+// cores: on Arduino 3.x (IDF 5.x) it is esp_memory_utils.h, on 2.x soc/soc_memory_types.h.
 #if __has_include(<esp_memory_utils.h>)
 #include <esp_memory_utils.h>
 #define LIONWIFI_HAS_PTR_EXTRAM 1
@@ -1323,13 +1323,13 @@ public:
             out.printf_P(PSTR(" | PSRAM: <b>%s</b> of <b>%s</b>"),
                          FsBrowser::FileSize(ESP.getFreePsram()).c_str(),
                          FsBrowser::FileSize(ESP.getPsramSize()).c_str());
-            // Минимум — ТОЛЬКО если он непустой. `ESP.getMinFreePsram()` это
-            // heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), и на ESP32-S2 (ядро
-            // 3.3.12, IDF 5.5) он отдаёт ноль при двух свободных мегабайтах и крупнейшем
-            // блоке в 2015 КБ — то есть не водяной знак, а «не ведётся». Печатать его
-            // значило бы писать «PSRAM кончалась под ноль» там, где этого не было:
-            // ложная тревога хуже отсутствующей цифры. Появится настоящий минимум —
-            // покажется сам, без правки кода.
+            // The minimum is printed ONLY when it is non-zero. ESP.getMinFreePsram() is
+            // heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM), and on the ESP32-S2
+            // (core 3.3.12, IDF 5.5) it returns zero with two megabytes free and a largest
+            // block of 2015 KB — that is not a watermark, it is "not tracked here".
+            // Printing it would claim PSRAM had run down to nothing when it never did, and
+            // a false alarm is worse than a missing figure. Once a real watermark shows up
+            // it appears on its own, with no code change.
             uint32_t psMin = ESP.getMinFreePsram();
             if (psMin)
                 out.printf_P(PSTR(" (min <b>%s</b>)"), FsBrowser::FileSize(psMin).c_str());
@@ -1365,7 +1365,7 @@ public:
             {
                 void *probe = malloc(n);
                 if (!probe)
-                    break; // под давлением не выпрашиваем — просто не показываем границу
+                    break; // under pressure: do not beg for memory, just omit the boundary
                 if (esp_ptr_external_ram(probe))
                     extFrom = n;
                 else
@@ -2570,7 +2570,15 @@ protected:
     {
         out.print(F("<!doctype html><html><head><meta charset=\"utf-8\">"
                     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-                    "<title>Access points</title><style>"
+                    "<title>Access points</title>"));
+        // Separate print() calls on purpose: a preprocessor directive inside the
+        // argument of a macro (F() is one) is not portable, GCC warns about it.
+#ifdef LIONWIFI_COMMON_CSS
+        // The sheet lives on the filesystem (see LIONWIFI_COMMON_CSS in FsBrowser.h);
+        // the classes this page uses are defined there, .aps-table included.
+        out.print(F(LIONWIFI_COMMON_CSS_LINK));
+#else
+        out.print(F("<style>"
                     "body{font-family:sans-serif;margin:12px;font-size:14px}"
                     "table{border-collapse:collapse;width:100%;max-width:760px}"
                     "th,td{padding:5px 8px;border-bottom:1px solid #ccc;text-align:left}"
@@ -2580,7 +2588,9 @@ protected:
                     ".dot{color:#1976d2;font-weight:700}"
                     ".act{margin-right:8px}"
                     ".legend{color:#666;font-size:12px}"
-                    "</style></head><body>"
+                    "</style>"));
+#endif
+        out.print(F("</head><body>"
                     // Nothing links TO this page, so it needs a way back out — landing
                     // here from a bookmark and having to edit the address bar is silly.
                     "<h3>Access points <a class=\"legend\" href=\"/\">&larr; home</a></h3>"));
@@ -2652,7 +2662,9 @@ protected:
             return;
         }
 
-        out.print(F("<table><thead><tr><th>SSID</th><th>BSSID</th><th>ch</th><th>RSSI</th><th></th></tr></thead><tbody>"));
+        // class="aps-table" is what the shared stylesheet targets (LIONWIFI_COMMON_CSS);
+        // the built-in sheet above styles the bare <table>, so the class is harmless there.
+        out.print(F("<table class=\"aps-table\"><thead><tr><th>SSID</th><th>BSSID</th><th>ch</th><th>RSSI</th><th></th></tr></thead><tbody>"));
         for (int i = 0; i < found; i++)
         {
             String ssid;

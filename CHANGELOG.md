@@ -3,6 +3,36 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.11.0 — 2026-11-15
+
+### Added
+- **`-D LIONWIFI_COMMON_CSS` — one shared stylesheet served from the filesystem.** With the
+  flag the library prints no CSS into its pages at all: the file browser and `/aps` carry a
+  `<link>` to `/common-styles.css` (path, cache window and emergency sheet are all
+  overridable), and the route serving that file is registered for you. The built-in sheets
+  are then not compiled, which is the point: the app partition is mirrored for OTA, so a
+  kilobyte in PROGMEM costs two kilobytes of flash while a kilobyte on the filesystem costs
+  one. Here that is ~2.5 KB of CSS out of the image, ~5 KB of flash.
+  - A missing file is **not** silent and needs no boot-time check: the route answers with a
+    few hundred bytes of emergency minimum — plain but readable — and logs one warning per
+    boot. Being asked for the fallback *is* the signal that the file is absent.
+  - Served with `Cache-Control: max-age=1209600` (two weeks). The file name is fixed on
+    purpose: a version in the name would mean reflashing every node to change a stylesheet.
+    The price is that a replaced sheet lives on in an already-open browser until the window
+    expires; `Ctrl+F5` cures it.
+  - A ready sheet covering every class the library emits ships as
+    `extras/common-styles.css` (and it is a plain file, so it costs no flash); uploading it
+    and the trade-offs are written up in `extras/readme.md`.
+  - The shipped sheet has two layers. Components addressed by their own class
+    (`.status`, `table.list`, `.fs-*`, `.aps-table`, buttons, inputs) are safe anywhere;
+    the typical-node layer — bare `h1/h2`, `table`, `form`, `label`, plus `.tiles/.tile`,
+    `.grid`, `.sub`, `.links` — is scoped to `<body class="node">`, so a page with its own
+    layout (an editor, say) is not restyled behind its author's back. A node adopting the
+    shared look adds that one class and deletes its own `<style>`.
+  - With the flag off nothing changes, byte for byte.
+- `/aps` listing now carries `class="aps-table"` so a shared sheet can target it; the
+  built-in sheet styles the bare `<table>` as before.
+
 ## 1.10.1 — 2026-11-14
 
 ### Fixed

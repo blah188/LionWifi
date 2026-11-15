@@ -200,7 +200,54 @@ extern const char __slash_favicon_ico__P[];
 //   .act-del      the Delete action link (danger color)
 //   .fs-summary   the Total/Free footer rows
 //   .fs-home      the "Home" link under the table
-#ifndef NO_FS_BROWSER_CSS
+// ---- One shared stylesheet served from the filesystem ----------------------
+//      -D LIONWIFI_COMMON_CSS
+//
+// With this flag the library prints no stylesheet into its pages at all: they
+// carry a <link> to a file on the filesystem, and the route serving that file is
+// registered for you. The built-in sheets (this one and the /aps one) are then
+// not compiled — that is the point. The app partition is mirrored for OTA, so a
+// kilobyte in PROGMEM costs two kilobytes of flash, while a kilobyte on the
+// filesystem costs one. With the flag OFF nothing changes, byte for byte.
+//
+// The file is not part of the firmware image, and flashing firmware does not
+// touch the filesystem, so it is uploaded once per node — e.g. through the
+// browser's own upload form:
+//     curl -u <user>:<pass> -F "name=@common-styles.css" http://<ip>/spiffs/ls
+// A ready sheet covering every class this library emits ships in extras/, with
+// the details in extras/readme.md.
+//
+// A MISSING FILE IS NOT SILENT, and needs no boot-time check: the route answers
+// with LIONWIFI_COMMON_CSS_FALLBACK — a few hundred bytes that keep the page
+// plain but readable — and logs one warning per boot. Being asked for the
+// fallback IS the signal that the file is absent.
+//
+// Knobs: LIONWIFI_COMMON_CSS_PATH   (default /common-styles.css)
+//        LIONWIFI_COMMON_CSS_MAXAGE (seconds, default 1209600 = two weeks; the
+//          price of a fixed file name is that a replaced sheet lives on in an
+//          already-open browser until this expires, Ctrl+F5 cures it)
+//        LIONWIFI_COMMON_CSS_FALLBACK (the emergency minimum itself)
+#ifdef LIONWIFI_COMMON_CSS
+#ifndef LIONWIFI_COMMON_CSS_PATH
+#define LIONWIFI_COMMON_CSS_PATH "/common-styles.css"
+#endif
+#ifndef LIONWIFI_COMMON_CSS_MAXAGE
+#define LIONWIFI_COMMON_CSS_MAXAGE "1209600"
+#endif
+#define LIONWIFI_COMMON_CSS_LINK "<link rel=\"stylesheet\" href=\"" LIONWIFI_COMMON_CSS_PATH "\">"
+#ifndef LIONWIFI_COMMON_CSS_FALLBACK
+// Deliberately tiny and opinion-free: readable text and a table with lines,
+// nothing else. It exists so that a node whose sheet was never uploaded is still
+// usable, not so that it looks right.
+#define LIONWIFI_COMMON_CSS_FALLBACK                                                               \
+    "body{margin:0;padding:12px;font-family:system-ui,sans-serif;font-size:14px;line-height:1.4}"  \
+    "table{border-collapse:collapse}"                                                              \
+    "th,td{padding:4px 8px;border-bottom:1px solid #ccc;text-align:left}"                          \
+    "th{font-size:12px}"
+#endif
+#endif
+
+#if !defined(NO_FS_BROWSER_CSS) && !defined(LIONWIFI_COMMON_CSS)
 // The built-in sheet is exposed as DEFAULT_FS_BROWSER_CSS so you can KEEP it and
 // just prepend overrides:  -D FS_BROWSER_CSS='":root{--fs-accent:#0aa}" DEFAULT_FS_BROWSER_CSS'
 #define DEFAULT_FS_BROWSER_CSS \
@@ -1307,7 +1354,9 @@ public:
     void renderLsHead(Print &out)
     {
         out.print(F("<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Files</title>"));
-#ifndef NO_FS_BROWSER_CSS
+#ifdef LIONWIFI_COMMON_CSS
+        out.print(F(LIONWIFI_COMMON_CSS_LINK));
+#elif !defined(NO_FS_BROWSER_CSS)
         out.print(F("<style>" FS_BROWSER_CSS "</style>"));
 #endif
         out.print(F("</head><body><div class=\"fs-wrap\">"
@@ -1624,6 +1673,61 @@ public:
     }
 #endif
 
+#ifdef LIONWIFI_COMMON_CSS
+    // Printed once per boot, not per request: a browser asks for the sheet on every
+    // page load, so a missing file would otherwise fill the log by itself.
+    bool _commonCssMissingLogged = false;
+
+    void LogCommonCssMissing()
+    {
+        if (_commonCssMissingLogged)
+            return;
+        _commonCssMissingLogged = true;
+        Logger.Log_P(ILogger::LvlWarning,
+                     PSTR("common css %s is NOT on the filesystem - serving the emergency minimum. Upload it: curl -F \"name=@common-styles.css\" <node>/spiffs/ls"),
+                     LIONWIFI_COMMON_CSS_PATH);
+    }
+
+#if defined(ESP32) && !defined(NO_ASYNC_WEB_SERVER)
+    void HandleCommonCss(AsyncWebServerRequest *request)
+    {
+        // exists() first: the async static path checks the file inside canHandle(),
+        // and we need the same answer to decide between file and fallback.
+        if (!LIONWIFI_FS.exists(LIONWIFI_COMMON_CSS_PATH))
+        {
+            LogCommonCssMissing();
+            request->send(200, F("text/css"), F(LIONWIFI_COMMON_CSS_FALLBACK));
+            return;
+        }
+        AsyncWebServerResponse *response = request->beginResponse(LIONWIFI_FS, LIONWIFI_COMMON_CSS_PATH, "text/css", false);
+        response->addHeader(F("Cache-Control"), F("max-age=" LIONWIFI_COMMON_CSS_MAXAGE));
+        request->send(response);
+    }
+#else
+    void HandleCommonCss()
+    {
+        if (!Logger.TryLockFsSemaphore()) // no-op (true) on ESP8266; real lock on ESP32+WebServer
+        {
+            _server.send(429, __text_plain__F, F("Server Busy"));
+            return;
+        }
+        File dataFile = LIONWIFI_FS.open(LIONWIFI_COMMON_CSS_PATH, "r");
+        if (!dataFile)
+        {
+            Logger.UnlockFsSemaphore();
+            LogCommonCssMissing();
+            // 200, not 404: the page must stay readable, and the log already said why.
+            _server.send(200, F("text/css"), F(LIONWIFI_COMMON_CSS_FALLBACK));
+            return;
+        }
+        _server.sendHeader(F("Cache-Control"), F("max-age=" LIONWIFI_COMMON_CSS_MAXAGE));
+        _server.streamFile(dataFile, F("text/css"));
+        dataFile.close();
+        Logger.UnlockFsSemaphore();
+    }
+#endif
+#endif
+
     void AddRoutes()
     {
 #ifdef USE_SD_CARD
@@ -1668,12 +1772,26 @@ public:
             [this](AsyncWebServerRequest *request, const String &filename, size_t index, uint8_t *data, size_t len, bool final) { HandleFileUpload(false, request, filename, index, data, len, final); } // Receive and save the file
         );
         _server.serveStatic("/favicon.ico", LIONWIFI_FS, "/favicon.ico");
+#ifdef LIONWIFI_COMMON_CSS
+        // Own route, not serveStatic(): it has to answer with the emergency minimum
+        // when the file is absent, and serveStatic can only miss (here the miss would
+        // fall through to the next handler, on the sync server into onNotFound).
+        // No auth: a stylesheet is not a secret, and a 401 on it would leave every
+        // page unstyled until the browser got around to asking with credentials.
+        _server.on(LIONWIFI_COMMON_CSS_PATH, HTTP_GET,
+                   [this](AsyncWebServerRequest *request) { HandleCommonCss(request); });
+#endif
         _server.onNotFound([this](AsyncWebServerRequest *request) {
             if (!HandleFileRead(request->url(), request))
                 request->send(404, __text_plain__F, F("404: Not Found")); // otherwise, respond with a 404 (Not Found) error
         });
 #else // sync web server (ESP8266, or ESP32 + NO_ASYNC_WEB_SERVER)
         _server.on(__slash_favicon_ico__F, [this]() { HandleFileRead(__slash_favicon_ico__F, false); });
+#ifdef LIONWIFI_COMMON_CSS
+        // See the note in the async branch: own route, no auth, falls back to the
+        // emergency minimum instead of 404.
+        _server.on(F(LIONWIFI_COMMON_CSS_PATH), HTTP_GET, [this]() { HandleCommonCss(); });
+#endif
         _server.on(F("/spiffs/ls"), HTTP_GET,
                    [this]() { HandleLs(false); });
         _server.on(F("/logout"), [this]() {
