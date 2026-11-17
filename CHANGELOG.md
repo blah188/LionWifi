@@ -3,6 +3,20 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
+## 1.12.0 — 2026-11-17
+
+### Changed
+- **`WIFI_BW20` renamed to `LIONWIFI_FORCE_BW20`.** The old name collided with the
+  `wifi_bandwidth_t` enumerator `WIFI_BW20` introduced in ESP-IDF 5.x (espressif32 8.0):
+  defining it as a build macro expanded the enumerator to nothing and broke the `esp_wifi`
+  headers (and thus the whole WiFi build). The old name is still honored for back-compat on
+  IDF 4.x, but on 8.0 only the `LIONWIFI_` name is usable — the enumerator can't be a macro.
+
+### Added
+- **Arduino-ESP32 core version in the `/status` SDK field.** On ESP32 the line now reads
+  e.g. `SDK: ESP32 3.3.12(LFS)` (was `ESP32(LFS)`), so a node's platform — 3.x (espressif32
+  8.0 / IDF 5.x) vs 2.x (7.1.3 / IDF 4.4) — is visible at a glance during a fleet migration.
+
 ## 1.11.0 — 2026-11-15
 
 ### Added

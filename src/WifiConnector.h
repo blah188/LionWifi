@@ -210,8 +210,11 @@
 //                            exactly one. Enforced by #error further down.
 //   CORE_WIFI                FreeRTOS core for the WiFi task (default 1).
 //   DISABLE_11N              Force 802.11b/g (some APs misbehave with 11n).
-//   WIFI_BW20                Force a 20 MHz channel (HT20) on the station link — steadier on
-//                            a weak or noisy one than the default 40 MHz.
+//   LIONWIFI_FORCE_BW20      Force a 20 MHz channel (HT20) on the station link — steadier on
+//                            a weak or noisy one than the default 40 MHz. (Was WIFI_BW20,
+//                            still accepted; but on espressif32 8.0 / IDF 5.x WIFI_BW20 is a
+//                            wifi_bandwidth_t enumerator, so defining it as a macro breaks the
+//                            esp_wifi headers — on 8.0 use the LIONWIFI_ name only.)
 //   MAX_WIFI_POWER           Set max TX power for weak links (that is also the default).
 //   WIFI_TX_POWER            Set TX power explicitly, as a wifi_power_t enumerator. Meant
 //                            for LOWERING it: small boards with weak decoupling fail to
@@ -1192,7 +1195,17 @@ public:
 #elif defined(PIO_FRAMEWORK_ARDUINO_ESPRESSIF_SDK305)
         return F("3.05 (experimental)");
 #elif defined(ESP32)
+        // Версия ядра Arduino-ESP32 как признак платформы в /status: 3.x = espressif32 8.0
+        // (IDF 5.x), 2.x = 7.1.3 (IDF 4.4). Нужно, чтобы по статусу видеть, кто флота переехал — P23.
+#if defined(ESP_ARDUINO_VERSION_MAJOR)
+#define LIONWIFI_STR2(x) #x
+#define LIONWIFI_STR(x) LIONWIFI_STR2(x)
+        return F("ESP32 " LIONWIFI_STR(ESP_ARDUINO_VERSION_MAJOR) "." LIONWIFI_STR(ESP_ARDUINO_VERSION_MINOR) "." LIONWIFI_STR(ESP_ARDUINO_VERSION_PATCH));
+#undef LIONWIFI_STR
+#undef LIONWIFI_STR2
+#else
         return F("ESP32");
+#endif
 #else
         return F("Unknown");
 #endif
@@ -2423,10 +2436,13 @@ protected:
         WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
         WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL); // the default, set explicitly
 #endif
-#ifdef WIFI_BW20 // force a 20 MHz channel width (HT20) on the station link
+#if defined(LIONWIFI_FORCE_BW20) || defined(WIFI_BW20) // force HT20 (20 MHz) on the station link
         // A narrower channel collects less noise, so on a weak link it holds better: at
         // -76 dBm against an access point running 40 MHz on a busy channel, HT20 buys real
         // SNR. Pair it with MAX_WIFI_POWER when the link is weak rather than noisy.
+        // NOTE: the flag is LIONWIFI_FORCE_BW20. The old name WIFI_BW20 is honored for
+        // back-compat on IDF 4.x, but on IDF 5.x (espressif32 8.0) it collides with the
+        // wifi_bandwidth_t enumerator of the same name and cannot be defined as a macro.
         esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
 #endif
         // TX power. The default is already the maximum, so MAX_WIFI_POWER is mostly a
