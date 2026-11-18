@@ -288,7 +288,7 @@
 //   GET /aps/clear                Forget the preference (also removes the file).
 //   GET/POST /update              Sketch or FS-image upload + reboot (with -D LIONWIFI_HTTP_OTA)
 //   GET /format                   Format the FS (ESP8266 / ESP32-sync only)
-//   GET /logout                   Clear HTTP Basic auth (401)
+//   GET /logout                   Clear HTTP Basic auth (401); absent with -D NO_AUTH
 //   GET /favicon.ico              Served from the filesystem
 //   GET /lion-tasks               LionTask debug dump (ESP8266)
 //   GET /sd/ls /sd/tail/<f> /sd/download/<f> /sd/del/<f>            (USE_SD_CARD)

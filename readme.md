@@ -223,7 +223,7 @@ Copy-paste examples for all three (as `#define`s or `build_flags`) are in
 `/del<f>` · `/log`, `/log/tail`, `/spiffs/log[/tail]`
 (LionLogger's current-day log) · `/restart` · `/format` (ESP8266 / ESP32-sync) ·
 `/update` (firmware upload, with `LIONWIFI_HTTP_OTA`) ·
-`/logout` · `/favicon.ico` · `/lion-tasks` (ESP8266). With `USE_SD_CARD`:
+`/logout` (not with `NO_AUTH`) · `/favicon.ico` · `/lion-tasks` (ESP8266). With `USE_SD_CARD`:
 `/sd/ls`, `/sd/tail/<f>`, `/sd/download/<f>`, `/sd/ren/<f>?to=<new>`,
 `/sd/del/<f>` (flat — no subfolders).
 

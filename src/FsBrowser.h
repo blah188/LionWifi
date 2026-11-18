@@ -1762,9 +1762,13 @@ public:
 #endif
         _server.on("/spiffs/ls", HTTP_GET,
                    [this](AsyncWebServerRequest *request) { HandleLs(request, false); });
+#ifndef NO_AUTH
+        // Without auth there is nothing to log out of: the route would only answer an
+        // empty 401, so it is not registered at all.
         _server.on("/logout", [this](AsyncWebServerRequest *request) {
             request->send(401, __text_plain__F, F("You are logged out"));
         });
+#endif
         _server.on(
             "/spiffs/ls", HTTP_POST,
             // onRequest runs after the upload: turn the recorded outcome into a response.
@@ -1794,9 +1798,11 @@ public:
 #endif
         _server.on(F("/spiffs/ls"), HTTP_GET,
                    [this]() { HandleLs(false); });
+#ifndef NO_AUTH // see the async branch
         _server.on(F("/logout"), [this]() {
             _server.send(401, __text_plain__F, F("You are logged out"));
         });
+#endif
         _server.on(
             F("/spiffs/ls"), HTTP_POST,               // if the client posts to the upload page
             [this]() { FinishUpload(false); },     // runs last: auth challenge + redirect/500
