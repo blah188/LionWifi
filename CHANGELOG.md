@@ -3,7 +3,7 @@
 All notable changes to LionWifi are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions use semver.
 
-## Unreleased (1.12.1)
+## 1.12.1 — 2026-11-18
 
 ### Changed
 - **`/logout` is not registered with `-D NO_AUTH`.** With auth off there is nothing to log
